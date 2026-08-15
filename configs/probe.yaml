@@ -1,5 +1,5 @@
 seed: 42
-base_checkpoint: outputs/base/qwen3_0_6b_full_attnres
+base_checkpoint: outputs/base/qwen3_14b_full_attnres
 data_manifest: outputs/data/splits.json
 data_config: configs/data.yaml
 partition_root: outputs/formal/discovery
@@ -8,9 +8,11 @@ probe_entry_task: math
 classes:
   0: math
   1: multihop
+  2: code
+confidence_threshold: 0.5
 feature_site: transformer_block_0_output
 pooling: mask_aware_mean
-classifier: "Linear(1024,2)"
+classifier: "Linear(5120,3)"
 feature_batch_size: 1
 batch_size: 256
 max_epochs: 20

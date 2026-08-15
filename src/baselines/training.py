@@ -4,29 +4,42 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import random
 from pathlib import Path
 from typing import Any, Literal
 
 import torch
+import torch.nn.functional as F
 from safetensors.torch import save_file
 from transformers import AutoTokenizer
 
-from src.baselines.modeling import BaselineQwen3ForCausalLM
+from src.baselines.modeling import BaselineDecoderLayer, BaselineQwen3ForCausalLM
 from src.common import load_yaml, sha256_file, sha256_json, tokenizer_sha256
 from src.data.format_tasks import (
     TASK_TO_SOURCE,
     collate_target_examples,
     encode_prompt_target,
-    load_local_split,
+    load_dataset_pool,
     load_manifest,
+)
+from src.distributed.fsdp_utils import (
+    DistributedContext,
+    all_reduce_sum,
+    barrier,
+    broadcast_object,
+    clip_grad_norm,
+    destroy_distributed,
+    init_distributed,
+    selected_parameter_sha256,
+    selected_parameter_state,
+    trainable_parameter_names,
+    wrap_qwen3_fsdp,
 )
 
 
 BaselineType = Literal["full_attnres", "fixed_block_attnres"]
 TASKS = ("math", "multihop")
-FIXED_PARTITION = [4, 4, 4, 4, 4, 4, 4]
+FIXED_PARTITION = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
 
 
 def query_parameter_names(model) -> tuple[str, ...]:
@@ -107,7 +120,7 @@ def validate_baseline_config(
         "gradient_clip_norm": 1.0,
         "scheduler": "constant",
         "maximum_sequence_length": 2048,
-        "expected_num_transformer_blocks": 28,
+        "expected_num_transformer_blocks": 40,
     }
     for key, value in expected.items():
         if config.get(key) != value:
@@ -124,7 +137,7 @@ def validate_baseline_config(
         if config.get("execution_mode") != "fixed":
             raise ValueError("Fixed baseline must use execution_mode=fixed")
         if config.get("fixed_partition") != FIXED_PARTITION:
-            raise ValueError("Fixed baseline partition must be [4,4,4,4,4,4,4]")
+            raise ValueError("Fixed baseline partition must contain ten four-layer blocks")
     for key in (
         "base_checkpoint",
         "data_manifest",
@@ -146,8 +159,8 @@ def _checkpoint_identity(checkpoint: Path) -> tuple[str, dict[str, Any]]:
     actual_hash = sha256_file(weight_files[0])
     if manifest.get("model_weights_sha256") != actual_hash:
         raise ValueError("Baseline base checkpoint weight hash mismatch")
-    if int(manifest.get("num_hidden_layers", -1)) != 28:
-        raise ValueError("Baseline base checkpoint must contain 28 Transformer blocks")
+    if int(manifest.get("num_hidden_layers", -1)) != 40:
+        raise ValueError("Baseline base checkpoint must contain 40 Transformer blocks")
     if not manifest.get("q_full_parameter_names") or not manifest.get("q_full_sha256"):
         raise ValueError("Baseline base checkpoint query identity is missing")
     return actual_hash, manifest
@@ -183,7 +196,6 @@ def select_training_records(
     if len(set(stable_ids)) != count or len(set(content_hashes)) != count:
         raise RuntimeError("Baseline selection is not unique")
     forbidden_splits = {
-        "stage2_discovery",
         "stage3_adapter_val",
         "probe_train",
         "probe_val",
@@ -209,18 +221,21 @@ def load_training_examples(
     tokenizer,
 ) -> tuple[tuple[Any, ...], list[str]]:
     records, source = select_training_records(task=task, config=config)
-    dataset = load_local_split(source["local_path"], str(source["official_split"]))
-    examples = tuple(
-        encode_prompt_target(
-            tokenizer,
-            task=task,
-            row=dataset[int(record["row_index"])],
-            field_mapping=source["field_mapping"],
-            stable_id=str(record["stable_id"]),
-            max_length=int(config["maximum_sequence_length"]),
+    pool = load_dataset_pool(load_yaml(config["data_config"]), source["dataset_name"])
+    examples = []
+    for record in records:
+        dataset, field_mapping = pool[str(record["official_split"])]
+        examples.append(
+            encode_prompt_target(
+                tokenizer,
+                task=task,
+                row=dataset[int(record["row_index"])],
+                field_mapping=field_mapping,
+                stable_id=str(record["stable_id"]),
+                max_length=int(config["maximum_sequence_length"]),
+            )
         )
-        for record in records
-    )
+    examples = tuple(examples)
     stable_ids = [example.stable_id for example in examples]
     expected_cases = int(config["training_cases_per_task"])
     if len(examples) != expected_cases or len(set(stable_ids)) != expected_cases:
@@ -245,8 +260,8 @@ def _configure_execution(
         model.config.baseline_partition = None
     else:
         partition = list(config["fixed_partition"])
-        if partition != FIXED_PARTITION or sum(partition) != 28:
-            raise ValueError("Fixed baseline partition is not the required 28-layer split")
+        if partition != FIXED_PARTITION or sum(partition) != 40:
+            raise ValueError("Fixed baseline partition is not the required 40-layer split")
         model.config.baseline_execution = "fixed"
         model.config.baseline_partition = partition
     model.config.use_cache = False
@@ -256,10 +271,13 @@ def _load_model_and_data(
     *,
     baseline_type: BaselineType,
     config: dict[str, Any],
-    device: torch.device,
+    context: DistributedContext,
 ):
     checkpoint = Path(config["base_checkpoint"])
-    base_hash, checkpoint_manifest = _checkpoint_identity(checkpoint)
+    base_hash, checkpoint_manifest = broadcast_object(
+        _checkpoint_identity(checkpoint) if context.is_rank0 else None,
+        context,
+    )
     tokenizer = AutoTokenizer.from_pretrained(
         checkpoint,
         local_files_only=True,
@@ -280,19 +298,35 @@ def _load_model_and_data(
     model = BaselineQwen3ForCausalLM.from_pretrained(
         checkpoint,
         local_files_only=True,
-        torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-    ).to(device)
+        torch_dtype=torch.bfloat16 if context.device.type == "cuda" else torch.float32,
+        low_cpu_mem_usage=True,
+    )
     _configure_execution(
         model,
         baseline_type=baseline_type,
         config=config,
     )
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
     trainable_names = freeze_except_pseudo_query(model)
     if list(trainable_names) != checkpoint_manifest["q_full_parameter_names"]:
         raise ValueError("Baseline query parameter names differ from the base checkpoint")
-    query_before = pseudo_query_hash(model)
+    query_before = broadcast_object(
+        pseudo_query_hash(model) if context.is_rank0 else None,
+        context,
+    )
     if query_before != checkpoint_manifest["q_full_sha256"]:
         raise ValueError("Baseline query initialization differs from the base checkpoint")
+    backbone_before = broadcast_object(
+        frozen_backbone_hash(model) if context.is_rank0 else None,
+        context,
+    )
+    model = wrap_qwen3_fsdp(
+        model,
+        context,
+        decoder_layer_classes=(BaselineDecoderLayer,),
+    )
     return (
         model,
         tokenizer,
@@ -301,6 +335,7 @@ def _load_model_and_data(
         trainable_names,
         query_before,
         base_hash,
+        backbone_before,
     )
 
 
@@ -321,7 +356,7 @@ def check_only(
     baseline_type: BaselineType,
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    context = init_distributed(require_cuda=False)
     (
         model,
         tokenizer,
@@ -330,19 +365,22 @@ def check_only(
         trainable_names,
         query_before,
         base_hash,
+        _backbone_before,
     ) = _load_model_and_data(
         baseline_type=baseline_type,
         config=config,
-        device=device,
+        context=context,
     )
     model.eval()
     first_case_losses: dict[str, float] = {}
     for task in config["training_task_order"]:
-        batch = _single_example_batch(examples_by_task[task][0], tokenizer, device)
+        batch = _single_example_batch(
+            examples_by_task[task][0], tokenizer, context.device
+        )
         with torch.no_grad(), torch.autocast(
-            device_type=device.type,
+            device_type=context.device.type,
             dtype=torch.bfloat16,
-            enabled=device.type == "cuda",
+            enabled=context.device.type == "cuda",
         ):
             loss = model(**batch, use_cache=False).loss
         if loss is None or not torch.isfinite(loss):
@@ -360,7 +398,7 @@ def check_only(
         "status": "PASS",
         "baseline_type": baseline_type,
         "tasks": list(config["training_task_order"]),
-        "device": str(device),
+        "device": str(context.device),
         "base_checkpoint_hash": base_hash,
         "num_transformer_blocks": int(model.config.num_hidden_layers),
         "fixed_partition": (
@@ -384,15 +422,18 @@ def check_only(
         "all_non_query_parameters_frozen": all(
             not parameter.requires_grad
             for name, parameter in model.named_parameters()
-            if name not in trainable_names
+            if "pseudo_query" not in name
         ),
         "query_before_hash": query_before,
         "first_case_loss_by_task": first_case_losses,
     }
     del model
-    if device.type == "cuda":
+    if context.device.type == "cuda":
         torch.cuda.empty_cache()
-    return result
+    is_rank0 = context.is_rank0
+    barrier(context)
+    destroy_distributed(context)
+    return result if is_rank0 else {}
 
 
 def train(
@@ -400,15 +441,11 @@ def train(
     baseline_type: BaselineType,
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
-        raise RuntimeError("Baseline training is intentionally single-process")
-    if not torch.cuda.is_available():
-        raise RuntimeError("Baseline training requires CUDA")
+    context = init_distributed()
     seed = int(config["seed"])
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    device = torch.device("cuda:0")
     (
         model,
         tokenizer,
@@ -417,15 +454,22 @@ def train(
         trainable_names,
         query_before,
         base_hash,
+        backbone_before,
     ) = _load_model_and_data(
         baseline_type=baseline_type,
         config=config,
-        device=device,
+        context=context,
     )
     output_dir = Path(config["output_root"])
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise FileExistsError(f"Refusing to overwrite baseline output: {output_dir}")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_error = None
+    if context.is_rank0:
+        if output_dir.exists() and any(output_dir.iterdir()):
+            output_error = f"Refusing to overwrite baseline output: {output_dir}"
+        else:
+            output_dir.mkdir(parents=True, exist_ok=True)
+    output_error = broadcast_object(output_error, context)
+    if output_error is not None:
+        raise FileExistsError(output_error)
     resolved_config = {
         **config,
         "tasks": list(config["training_task_order"]),
@@ -436,11 +480,11 @@ def train(
             for task in config["training_task_order"]
         },
     }
-    (output_dir / "config.json").write_text(
-        json.dumps(resolved_config, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    backbone_before = frozen_backbone_hash(model)
+    if context.is_rank0:
+        (output_dir / "config.json").write_text(
+            json.dumps(resolved_config, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=float(config["learning_rate"]),
@@ -448,12 +492,7 @@ def train(
         eps=float(config["eps"]),
         weight_decay=float(config["weight_decay"]),
     )
-    optimizer_names = {
-        name
-        for name, parameter in model.named_parameters()
-        if any(parameter is candidate for group in optimizer.param_groups for candidate in group["params"])
-    }
-    if optimizer_names != set(trainable_names):
+    if set(trainable_parameter_names(model)) != set(trainable_names):
         raise RuntimeError("Baseline optimizer does not contain exactly pseudo-query")
 
     model.train()
@@ -466,7 +505,8 @@ def train(
     total_target_tokens = 0
     losses: list[float] = []
     positive_finite_gradient_seen = False
-    with metrics_path.open("x", encoding="utf-8") as metrics_handle:
+    metrics_handle = metrics_path.open("x", encoding="utf-8") if context.is_rank0 else None
+    try:
         training_stream = [
             (task, example)
             for task in config["training_task_order"]
@@ -475,20 +515,40 @@ def train(
         for step, (task, example) in enumerate(training_stream, start=1):
             if example.stable_id in processed_ids:
                 raise RuntimeError("Baseline attempted to repeat a training case")
-            batch = _single_example_batch(example, tokenizer, device)
-            input_tokens = int(batch["attention_mask"].sum().item())
-            target_tokens = _target_token_count(batch["labels"])
+            batch = _single_example_batch(example, tokenizer, context.device)
+            labels = batch.pop("labels")
+            active = context.rank == (step - 1) % context.world_size
+            input_tokens = int(batch["attention_mask"].sum().item()) if active else 0
+            target_tokens = _target_token_count(labels) if active else 0
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output = model(**batch, use_cache=False)
-                loss = output.loss
-            if loss is None or not torch.isfinite(loss):
+            local_loss = (
+                F.cross_entropy(
+                    output.logits.float().reshape(-1, output.logits.shape[-1]),
+                    labels.reshape(-1),
+                    ignore_index=-100,
+                    reduction="sum",
+                )
+                if active
+                else output.logits.float().sum() * 0.0
+            )
+            global_target_tokens = int(
+                all_reduce_sum(
+                    torch.tensor(target_tokens, device=context.device, dtype=torch.long),
+                    context,
+                ).item()
+            )
+            if global_target_tokens <= 0:
+                raise RuntimeError("Baseline training case has no target tokens")
+            loss = local_loss * context.world_size / global_target_tokens
+            if not torch.isfinite(loss):
                 raise FloatingPointError("Baseline training loss is invalid")
             loss.backward()
             if any(
                 parameter.grad is not None
                 for name, parameter in model.named_parameters()
-                if name not in trainable_names
+                if "pseudo_query" not in name
             ):
                 raise RuntimeError("A frozen baseline parameter received a gradient")
             gradients = [
@@ -499,43 +559,54 @@ def train(
             if not gradients or not all(torch.isfinite(gradient).all() for gradient in gradients):
                 raise FloatingPointError("Baseline query gradients are missing or invalid")
             gradient_norm = float(
-                torch.linalg.vector_norm(
-                    torch.stack([gradient.norm() for gradient in gradients])
-                ).cpu()
+                clip_grad_norm(
+                    model,
+                    (parameter for parameter in model.parameters() if parameter.requires_grad),
+                    float(config["gradient_clip_norm"]),
+                ).detach().float().cpu()
             )
             if not math.isfinite(gradient_norm) or gradient_norm <= 0.0:
                 raise FloatingPointError("Baseline query gradient norm is not positive")
             positive_finite_gradient_seen = True
-            torch.nn.utils.clip_grad_norm_(
-                [parameter for parameter in model.parameters() if parameter.requires_grad],
-                max_norm=float(config["gradient_clip_norm"]),
-            )
             optimizer.step()
-            loss_value = float(loss.detach().cpu())
+            loss_value = float(
+                all_reduce_sum(local_loss.detach(), context).cpu()
+            ) / global_target_tokens
+            input_tokens = int(
+                all_reduce_sum(
+                    torch.tensor(input_tokens, device=context.device, dtype=torch.long),
+                    context,
+                ).item()
+            )
+            target_tokens = global_target_tokens
             processed_ids.append(example.stable_id)
             processed_ids_by_task[task].append(example.stable_id)
             total_input_tokens += input_tokens
             total_target_tokens += target_tokens
             losses.append(loss_value)
-            metrics_handle.write(
-                json.dumps(
-                    {
-                        "step": step,
-                        "task": task,
-                        "stable_id": example.stable_id,
-                        "loss": loss_value,
-                        "gradient_norm": gradient_norm,
-                        "learning_rate": float(optimizer.param_groups[0]["lr"]),
-                        "nonpadding_input_tokens": input_tokens,
-                        "target_tokens": target_tokens,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
+            if metrics_handle is not None:
+                metrics_handle.write(
+                    json.dumps(
+                        {
+                            "step": step,
+                            "task": task,
+                            "stable_id": example.stable_id,
+                            "loss": loss_value,
+                            "gradient_norm": gradient_norm,
+                            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                            "nonpadding_input_tokens": input_tokens,
+                            "target_tokens": target_tokens,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
-            metrics_handle.flush()
+                metrics_handle.flush()
             del batch, output, loss, gradients
+    finally:
+        if metrics_handle is not None:
+            metrics_handle.close()
 
     expected_ids = [
         stable_id
@@ -553,21 +624,34 @@ def train(
         for task in TASKS
     ):
         raise RuntimeError("Baseline per-task one-pass count verification failed")
-    query_after = pseudo_query_hash(model)
-    backbone_after = frozen_backbone_hash(model)
+    query_state = selected_parameter_state(
+        model,
+        context,
+        lambda name, _parameter: "pseudo_query" in name,
+    )
+    query_after = None
+    if context.is_rank0:
+        assert query_state is not None
+        query_after = sha256_json(
+            {name: value.detach().float().cpu().tolist() for name, value in query_state.items()}
+        )
+    query_after = broadcast_object(query_after, context)
+    backbone_after = selected_parameter_sha256(
+        model,
+        context,
+        lambda name, _parameter: "pseudo_query" not in name,
+    )
     if backbone_before != backbone_after:
         raise RuntimeError("Baseline frozen backbone changed during training")
     if query_before == query_after:
         raise RuntimeError("Baseline pseudo-query did not change during training")
     if not positive_finite_gradient_seen:
         raise RuntimeError("Baseline never observed a positive finite query gradient")
-    query_state = {
-        name: parameter.detach().cpu().contiguous()
-        for name, parameter in model.named_parameters()
-        if name in trainable_names
-    }
     query_path = output_dir / "query.safetensors"
-    save_file(query_state, query_path)
+    if context.is_rank0:
+        assert query_state is not None
+        save_file(query_state, query_path)
+    barrier(context)
     manifest = {
         "status": "PASS",
         "baseline_type": baseline_type,
@@ -611,11 +695,15 @@ def train(
         and manifest["repeat_count"] == 0
     ):
         raise RuntimeError("Baseline completion manifest verification failed")
-    (output_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    return manifest
+    if context.is_rank0:
+        (output_dir / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    is_rank0 = context.is_rank0
+    barrier(context)
+    destroy_distributed(context)
+    return manifest if is_rank0 else {}
 
 
 def run_cli(
@@ -641,4 +729,5 @@ def run_cli(
             config=config,
         )
     )
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    if result:
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))

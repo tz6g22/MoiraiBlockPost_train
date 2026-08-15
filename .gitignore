@@ -1,4 +1,7 @@
 .venv/
+.venv-*-delete/
+.python/
+.uv-cache/
 artifacts/
 outputs/
 __pycache__/

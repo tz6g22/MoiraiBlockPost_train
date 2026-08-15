@@ -1,5 +1,5 @@
 tokenizer:
-  name_or_path: outputs/base/qwen3_0_6b_full_attnres
+  name_or_path: outputs/base/qwen3_14b_full_attnres
   local_files_only: true
 
 split_seed: 42
@@ -8,13 +8,24 @@ output_dir: outputs/data
 
 counts:
   stage2_discovery:
-    math: 200
-    multihop: 200
-  stage3_adapter_train: 200
+    math: 1000
+    multihop: 1000
+    code: 200
+  stage3_adapter_train: 1000
   stage3_adapter_val: 500
   probe_train: 200
   probe_val: 500
   stage4_final_eval: 10
+
+task_count_overrides:
+  code:
+    stage3_adapter_train: 200
+    stage3_adapter_val: 45
+    probe_train: 100
+    probe_val: 45
+
+allowed_cross_stage_reuse:
+  - [stage2_discovery, stage3_adapter_train]
 
 sources:
   gsm8k:
@@ -62,12 +73,30 @@ sources:
       question: question
       target: answer
 
+  mbpp:
+    dataset_name: mbpp
+    repo_id: google-research-datasets/mbpp
+    subset: full
+    local_path: outputs/data/mbpp_full_preprocessed
+    revision: 4bb6404fdc6cacfda99d4ac4205087b89d32030c
+    official_split: train
+    expected_rows: 374
+    field_mapping:
+      id: stable_id
+      prompt: prompt
+      target: target
+      test_list: test_list
+      test_setup_code: test_setup_code
+      challenge_test_list: challenge_test_list
+
 discovery_sources:
   math:
-    gsm8k: 100
-    svamp: 100
+    gsm8k: 500
+    svamp: 500
   multihop:
-    clutrr: 200
+    clutrr: 1000
+  code:
+    mbpp: 200
 
 validation_sources:
   multihop:
@@ -88,6 +117,22 @@ validation_sources:
       story: story
       query: query
       target: target_text
+
+  code:
+    dataset_name: mbpp
+    repo_id: google-research-datasets/mbpp
+    subset: full
+    local_path: outputs/data/mbpp_full_preprocessed
+    revision: 4bb6404fdc6cacfda99d4ac4205087b89d32030c
+    official_split: validation
+    expected_rows: 90
+    field_mapping:
+      id: stable_id
+      prompt: prompt
+      target: target
+      test_list: test_list
+      test_setup_code: test_setup_code
+      challenge_test_list: challenge_test_list
 
 probe_sources:
   gsm8k_main_train:
@@ -133,3 +178,19 @@ evaluation_sources:
       story: story
       query: query
       target: target_text
+
+  code:
+    dataset_name: mbpp
+    repo_id: google-research-datasets/mbpp
+    subset: full
+    local_path: outputs/data/mbpp_full_preprocessed
+    revision: 4bb6404fdc6cacfda99d4ac4205087b89d32030c
+    official_split: test
+    expected_rows: 500
+    field_mapping:
+      id: stable_id
+      prompt: prompt
+      target: target
+      test_list: test_list
+      test_setup_code: test_setup_code
+      challenge_test_list: challenge_test_list

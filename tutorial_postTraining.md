@@ -1,6 +1,6 @@
 # MoiraiBlock Post-Training Tutorial
 
-> **当前有效版本。** 本文档描述 MoiraiBlock 在已训练好的 Hugging Face Qwen3-0.6B 上进行后训练、任务特定 partition discovery、pseudo-query 训练、Probe 路由以及最终推理/评估的完整机制。
+> **当前有效版本。** 本文档描述 MoiraiBlock 在已训练好的 Hugging Face Qwen3-14B 上进行后训练、任务特定 partition discovery、pseudo-query 训练、Probe 路由以及最终推理/评估的完整机制。
 >
 > 本文档优先于旧版包含 Full AttnRes 预训练、Factual 第三任务、Fixed Block baseline 等描述的计划。
 
@@ -10,19 +10,21 @@
 
 MoiraiBlock 不重新训练一个语言模型，也不先训练一个 Full AttnRes 基座。
 
-起点是已经具备语言能力的 Qwen3-0.6B。MoiraiBlock 只在这个已有模型之上学习**深度信息如何按任务组织和聚合**。
+起点是已经具备语言能力的 Qwen3-14B。MoiraiBlock 只在这个已有模型之上学习**深度信息如何按任务组织和聚合**。
 
-系统最终定义三种并列的推理 mode：
+系统最终定义四种并列的推理 mode：
 
 1. **Math mode**
 2. **Multi-hop mode**
-3. **Fixed Block mode**
+3. **Code mode**
+4. **Fixed Block mode**
 
 最终每个 mode 都由一对不可分割的配置组成：
 
 ```text
 Math      = (P_math,     Q_math)
 Multi-hop = (P_multihop, Q_multihop)
+Code      = (P_code,     Q_code)
 Fixed     = (P_fixed,    Q_fixed)
 ```
 
@@ -31,58 +33,47 @@ Fixed     = (P_fixed,    Q_fixed)
 - `P_*`：Transformer Block partition；
 - `Q_*`：该 partition 对应训练得到的 pseudo-query。
 
-三种 mode 在 query training 阶段是**平行独立**的配置。
+四种 mode 在 query training 阶段是**平行独立**的配置。
 
 Fixed Block 只有一个特殊之处：它的 partition 不需要 Discovery，因为它直接采用 Kimi Block AttnRes 的固定分块定义——**每 4 个完整 Transformer Blocks 形成一个 Block**。
 
-Fixed Block **不是 Math/Multi-hop 在 Discovery 或 query training 阶段的 fallback，也不是默认替代结构**。它只在最终推理阶段，当 Probe 对 Math/Multi-hop 的判别置信度低于阈值时，作为第三种备选推理 mode 被选择。
+Fixed Block **不是 Math/Multi-hop/Code 在 Discovery 或 query training 阶段的 fallback，也不是默认替代结构**。它只在最终推理阶段，当 Probe 对 Math/Multi-hop/Code 的判别置信度低于阈值时，作为低置信度备选推理 mode 被选择。
 
 ---
 
 # 2. 总流程
 
 ```text
-                 Hugging Face Qwen3-0.6B
+                 Hugging Face Qwen3-14B
                           │
                           ▼
                 Frozen pretrained backbone
                           │
-          ┌───────────────┴────────────────┐
-          │                                │
-     Stage 1A                          Stage 1B
- Math Discovery                  Multi-hop Discovery
-          │                                │
-          ▼                                ▼
-       P_math                         P_multihop
-          │                                │
-          └───────────────┬────────────────┘
-                          │
-                          ▼
-                   Stage 2 Query Training
-                          │
           ┌───────────────┼────────────────┐
           │               │                │
-       P_math          P_multihop        P_fixed
+     Math Discovery  Multi-hop Discovery  Code Discovery
           │               │                │
-       train Q          train Q          train Q
-          │               │                │
-       Q_math          Q_multihop        Q_fixed
+          ▼               ▼                ▼
+       P_math         P_multihop         P_code
           │               │                │
           └───────────────┼────────────────┘
                           │
                           ▼
+                   Stage 2 Query Training
+                          │
+          Math / Multi-hop / Code / Fixed
+          each trains its own pseudo-query
+                          │
+                          ▼
                    Stage 3 Probe Training
-                    Math vs Multi-hop
+                Math / Multi-hop / Code
                           │
                           ▼
                  Stage 4 Inference / Eval
                           │
                   Probe + confidence
-               ┌──────────┼───────────┐
-               │          │           │
-             Math     Multi-hop   low confidence
-               │          │           │
-        P_math,Q_math  P_multi,Q_multi P_fixed,Q_fixed
+        high-conf task → matching P_task,Q_task
+        low confidence → P_fixed,Q_fixed
 ```
 
 ---
@@ -154,11 +145,12 @@ Block summary 必须保持 Kimi Block AttnRes 的 residual accumulation 语义�
 
 # 4. Stage 1：Task-specific Partition Discovery
 
-Stage 1 只对两个任务执行：
+Stage 1 只对三个 supervised 任务执行：
 
 ```text
 Math
 Multi-hop
+Code
 ```
 
 Fixed Block **完全跳过 Discovery**。
@@ -175,13 +167,31 @@ P_fixed = predefined fixed partition
 ```text
 P_math
 P_multihop
+P_code
 ```
+
+当前 case 数量与数据源固定为：
+
+| Mode | Discovery | Query Training |
+| --- | ---: | ---: |
+| Math | 1000（GSM8K 500 + SVAMP 500） | 1000（GSM8K） |
+| Multi-hop | 1000（CLUTRR） | 1000（CLUTRR） |
+| Code | 200（MBPP dataset pool） | 200（MBPP dataset pool） |
+| Fixed | 不执行 | 2200（Math 1000 + Multi-hop 1000 + Code 200） |
+
+每个 Discovery 集合内部、每个 task Query Training 集合内部，以及 Fixed 的每个
+task 子集内部，都必须由 unique examples 构成，禁止 cycle 或 repeat 补足数量。
+`stage2_discovery` 与 `stage3_adapter_train` 之间允许复用同一 stable ID；除此之外，
+Probe、validation、final evaluation 与这些用途之间仍禁止 stable ID 或 semantic
+content 交叉。数据使用时不区分官方 train/validation/test，原始 split 只作为
+metadata 保留。最终 evaluation 必须从所有前序用途均未出现过的 stable ID 补集
+中选择，不能根据官方 split 标签预先决定用途。
 
 ---
 
 # 5. Discovery 的总体算法
 
-对 Math 和 Multi-hop 分别独立执行：
+对 Math、Multi-hop 和 Code 分别独立执行：
 
 ```text
 Frozen reference forward
@@ -199,7 +209,7 @@ boundary refinement
 最终 P_task
 ```
 
-Math 和 Multi-hop 从数据、cost matrix、DP、replay 到最终 partition 都必须独立。
+Math、Multi-hop 和 Code 从数据、cost matrix、DP、replay 到最终 partition 都必须独立。
 
 Fixed partition 不能参与任何一步。
 
@@ -325,6 +335,7 @@ C_{task}(s,e)=
 ```text
 C_math(s,e)
 C_multihop(s,e)
+C_code(s,e)
 ```
 
 两者绝不能共用。
@@ -647,6 +658,7 @@ D_{old}-D_{new}
 ```text
 P_math
 P_multihop
+P_code
 ```
 
 ---
@@ -667,13 +679,14 @@ Fixed mode 不执行上述 Discovery。
 P_fixed
 ```
 
-对于当前 Qwen3-0.6B，这个规则直接按模型真实 Transformer Block 顺序连续分组。
+对于当前 Qwen3-14B，这个规则直接按模型真实 Transformer Block 顺序连续分组。
 
 必须强调：
 
 ```text
 P_fixed 不进入 Math DP
 P_fixed 不进入 Multi-hop DP
+P_fixed 不进入 Code DP
 P_fixed 不作为 local surrogate 的默认 partition
 P_fixed 不作为 replay 的 fallback
 P_fixed 不参与 N selection
@@ -686,15 +699,16 @@ Discovery 与 Fixed mode 之间没有“托底”关系。
 
 # 18. Stage 2：Pseudo-query Training
 
-Discovery 完成后，有三套 partition：
+Discovery 完成后，有四套 partition：
 
 ```text
 P_math       ← Discovery
 P_multihop   ← Discovery
+P_code       ← Discovery
 P_fixed      ← predefined fixed-size partition
 ```
 
-接下来为三套 partition **分别训练自己的 pseudo-query**。
+接下来为四套 partition **分别训练自己的 pseudo-query**。
 
 ---
 
@@ -719,7 +733,7 @@ LM head
 
 ---
 
-# 20. 三条平行 Query Training 路径
+# 20. 四条平行 Query Training 路径
 
 ## 20.1 Math
 
@@ -765,7 +779,33 @@ Config_multihop = (P_multihop, Q_multihop)
 
 ---
 
-## 20.3 Fixed
+## 20.3 Code
+
+```text
+P_code
++
+frozen Qwen3
++
+MBPP dataset pool
+        ↓
+train pseudo-query only
+        ↓
+Q_code
+```
+
+最终：
+
+```text
+Config_code = (P_code, Q_code)
+```
+
+`Q_code` 只使用 MBPP 数据集，但不按官方 train/validation/test 标签限制候选样本。
+最终 Code evaluation 仍必须排除所有已参与 Discovery、Query Training、Probe 或
+model selection 的 stable ID。
+
+---
+
+## 20.4 Fixed
 
 ```text
 P_fixed
@@ -787,9 +827,9 @@ Config_fixed = (P_fixed, Q_fixed)
 
 `P_fixed` 不需要 Discovery，但 `Q_fixed` 必须经过 query training，否则 Fixed mode 没有完整的可用 AttnRes aggregation 参数。
 
-三条 query training 路径在这一阶段是**平行关系**。
+四条 query training 路径在这一阶段是**平行关系**。
 
-Fixed mode 此时仍然不是 Math 或 Multi-hop 的 fallback。
+Fixed mode 此时仍然不是 Math、Multi-hop 或 Code 的 fallback。
 
 ---
 
@@ -826,11 +866,12 @@ LM logits
 
 # 22. Query Training 的独立性约束
 
-必须最终保存三套独立 query：
+必须最终保存四套独立 query：
 
 ```text
 Q_math
 Q_multihop
+Q_code
 Q_fixed
 ```
 
@@ -840,6 +881,7 @@ Q_fixed
 Q_math == Q_multihop checkpoint
 Q_fixed 覆盖 Q_math
 Q_multihop 从 Q_math optimizer state 继续训练
+Q_code 从其他 task optimizer state 继续训练
 一个 query 在推理时搭配多个不同 partition
 只切换 partition 不切换 query
 ```
@@ -872,13 +914,14 @@ non-padding input tokens
 
 Probe 只负责一个决策：
 
-> 当前输入是否能被高置信度识别为 Math 或 Multi-hop？
+> 当前输入是否能被高置信度识别为 Math、Multi-hop 或 Code？
 
 Probe 训练标签只有：
 
 ```text
 Math
 Multi-hop
+Code
 ```
 
 Fixed 不是一个训练任务类别；Fixed 是**低置信度情况下的推理 mode**。
@@ -903,6 +946,9 @@ if confidence >= 0.5 and predicted_task == math:
 elif confidence >= 0.5 and predicted_task == multihop:
     mode = multihop
 
+elif confidence >= 0.5 and predicted_task == code:
+    mode = code
+
 else:
     mode = fixed
 ```
@@ -916,6 +962,9 @@ high-confidence Math
 high-confidence Multi-hop
 → (P_multihop, Q_multihop)
 
+high-confidence Code
+→ (P_code, Q_code)
+
 confidence < 0.5
 → (P_fixed, Q_fixed)
 ```
@@ -924,19 +973,13 @@ confidence < 0.5
 
 # 26. Probe Confidence 的实现要求
 
-这里有一个必须避免的实现陷阱。
-
-如果把 confidence 定义为标准**二分类 softmax 的最大概率**：
+Probe 是三分类，因此 confidence 定义为三分类 softmax 的最大概率：
 
 \[
-\max(p_{math},p_{multihop})
+\max(p_{math},p_{multihop},p_{code})
 \]
 
-那么它理论上总是 `>= 0.5`，低于 `0.5` 的 fallback 几乎永远不会发生。
-
-因此实现必须保证项目中的 `confidence` 是一个**确实可以低于 0.5 的置信度量**，例如使用能够表达“不属于两个已知分布”的校准 confidence/acceptance score。
-
-本文档的硬功能要求不是限定某一种校准算法，而是：
+三分类最大概率的理论下界是 `1/3`，因此低于 `0.5` 的 fallback 分支可达。硬功能要求是：
 
 ```text
 confidence < 0.5 必须在实际系统中可达
@@ -1001,7 +1044,7 @@ predicted task + confidence
        yes     │      no
         │      │       │
         ▼      │       ▼
- Math / Multi-hop      Fixed
+ Math / Multi-hop / Code   Fixed
         │              │
         ▼              ▼
 load task P+Q      load P_fixed+Q_fixed
@@ -1053,7 +1096,21 @@ active_mode      = multihop
 
 ---
 
-# 31. Fixed Mode
+# 31. Code Mode
+
+若 Probe 高置信度判定为 Code：
+
+```text
+active_partition = P_code
+active_query     = Q_code
+active_mode      = code
+```
+
+完整 generation 内保持不变。
+
+---
+
+# 32. Fixed Mode
 
 只有最终推理阶段出现以下条件时：
 
@@ -1071,7 +1128,7 @@ active_mode      = fixed
 
 这里的 Fixed 是：
 
-> 对“Probe 无法高置信度归入 Math 或 Multi-hop”的输入采用的预定义 Block AttnRes partition 方案。
+> 对“Probe 无法高置信度归入 Math、Multi-hop 或 Code”的输入采用的预定义 Block AttnRes partition 方案。
 
 必须再次强调：
 
@@ -1079,8 +1136,10 @@ active_mode      = fixed
 Fixed 不参与 Discovery
 Fixed 不给 Math Discovery 托底
 Fixed 不给 Multi-hop Discovery 托底
+Fixed 不给 Code Discovery 托底
 Fixed 不给 Math query training 托底
 Fixed 不给 Multi-hop query training 托底
+Fixed 不给 Code query training 托底
 Fixed 不覆盖失败的 task checkpoint
 ```
 
@@ -1088,7 +1147,7 @@ Fixed 不覆盖失败的 task checkpoint
 
 ---
 
-# 32. 连续不同任务输入时的状态切换
+# 33. 连续不同任务输入时的状态切换
 
 系统必须支持逐 case 切换完整 `(P,Q)` bundle。
 
@@ -1101,10 +1160,13 @@ Case 1: Math
 Case 2: Multi-hop
 → P_multihop + Q_multihop
 
-Case 3: low confidence
+Case 3: Code
+→ P_code + Q_code
+
+Case 4: low confidence
 → P_fixed + Q_fixed
 
-Case 4: Math
+Case 5: Math
 → P_math + Q_math
 ```
 
@@ -1119,7 +1181,7 @@ Case 4: Math
 
 ---
 
-# 33. Evaluation
+# 34. Evaluation
 
 最终 Evaluation 评估的是**整个 routing + mode-specific configuration 系统**，而不是只评估 Probe 或只评估某一个 partition。
 
@@ -1144,6 +1206,7 @@ memory / efficiency
 ```text
 Math routed to Math rate
 Multi-hop routed to Multi-hop rate
+Code routed to Code rate
 Fixed selection rate
 high-confidence wrong-route rate
 end-to-end task accuracy
@@ -1154,16 +1217,16 @@ memory
 
 ---
 
-# 34. 三种 Mode 的关系总结
+# 35. 四种 Mode 的关系总结
 
-三种模式在 query training 阶段：
+四种模式在 query training 阶段：
 
 ```text
-Math            Multi-hop          Fixed
- │                  │                │
-P_math          P_multihop        P_fixed
- │                  │                │
-Q_math          Q_multihop        Q_fixed
+Math       Multi-hop      Code       Fixed
+ │             │           │           │
+P_math     P_multihop    P_code     P_fixed
+ │             │           │           │
+Q_math     Q_multihop    Q_code     Q_fixed
 ```
 
 是平行关系。
@@ -1173,6 +1236,7 @@ Q_math          Q_multihop        Q_fixed
 ```text
 P_math      ← task-specific Discovery
 P_multihop  ← task-specific Discovery
+P_code      ← task-specific Discovery
 P_fixed     ← predefined 4-Transformer-Block grouping
 ```
 
@@ -1181,6 +1245,7 @@ P_fixed     ← predefined 4-Transformer-Block grouping
 ```text
 Probe high confidence Math      → Math mode
 Probe high confidence Multi-hop → Multi-hop mode
+Probe high confidence Code      → Code mode
 Probe low confidence            → Fixed mode
 ```
 
@@ -1188,7 +1253,7 @@ Probe low confidence            → Fixed mode
 
 ---
 
-# 35. 实现中必须禁止的错误语义
+# 36. 实现中必须禁止的错误语义
 
 以下任何一种实现都属于流程错误：
 
@@ -1198,11 +1263,12 @@ Probe low confidence            → Fixed mode
 Discovery 默认 mode=fixed
 Math DP 从 P_fixed 开始
 Multi-hop DP 从 P_fixed 开始
+Code DP 从 P_fixed 开始
 Discovery 失败后返回 P_fixed
 P_fixed 参与 N selection
 P_fixed 参与 boundary refinement
-Math/Multi-hop 共用 cost matrix
-Math/Multi-hop 共用最终 partition
+Math/Multi-hop/Code 共用 cost matrix
+Math/Multi-hop/Code 共用最终 partition
 ```
 
 ## Query Training 错误
@@ -1210,16 +1276,16 @@ Math/Multi-hop 共用最终 partition
 ```text
 Math trainer 名义加载 P_math，底层 forward 实际 mode=fixed
 Multi-hop trainer 名义加载 P_multihop，底层实际使用 P_fixed
-Q_fixed 被 Math/Multi-hop 共用
-Q_math 与 Q_multihop 保存到同一 checkpoint
+Code trainer 名义加载 P_code，底层实际使用 P_fixed
+Q_fixed 被 Math/Multi-hop/Code 共用
+Q_math、Q_multihop 与 Q_code 保存到同一 checkpoint
 backbone 被 optimizer 更新
 ```
 
 ## Probe 错误
 
 ```text
-Fixed 被当成第三个 supervised task label
-Probe 的 max two-class softmax probability < 0.5 作为 fallback 条件
+Fixed 被当成 supervised task label
 Probe hidden 继续进入正式 forward
 Probe KV cache 继续用于 generation
 ```
@@ -1229,19 +1295,20 @@ Probe KV cache 继续用于 generation
 ```text
 Probe=Math 但只切换 partition、不切 query
 Probe=Multi-hop 但仍使用 Math query
-low confidence 仍强制进入 Math/Multi-hop
-Fixed 在高置信度 Math/Multi-hop 时覆盖 task mode
+Probe=Code 但仍使用 Math/Multi-hop query
+low confidence 仍强制进入 Math/Multi-hop/Code
+Fixed 在高置信度 Math/Multi-hop/Code 时覆盖 task mode
 下一 case 沿用上一 case 的 partition/query
 ```
 
 ---
 
-# 36. 最终不可变的功能闭环
+# 37. 最终不可变的功能闭环
 
 最终 MoiraiBlock 后训练必须形成以下闭环：
 
 ```text
-1. 已训练 Qwen3-0.6B
+1. 已训练 Qwen3-14B
 
 2. Math Discovery
    → P_math
@@ -1249,26 +1316,31 @@ Fixed 在高置信度 Math/Multi-hop 时覆盖 task mode
 3. Multi-hop Discovery
    → P_multihop
 
-4. Fixed partition
+4. Code Discovery
+   → P_code
+
+5. Fixed partition
    → P_fixed = 每4个完整 Transformer Blocks 一组
 
-5. Frozen-backbone query training
+6. Frozen-backbone query training
    P_math      → Q_math
    P_multihop  → Q_multihop
+   P_code      → Q_code (MBPP dataset pool only)
    P_fixed     → Q_fixed
 
-6. Probe training
-   Math / Multi-hop classification + usable confidence
+7. Probe training
+   Math / Multi-hop / Code classification + usable confidence
 
-7. Inference
+8. Inference
    high-conf Math      → P_math + Q_math
    high-conf Multi-hop → P_multihop + Q_multihop
+   high-conf Code      → P_code + Q_code
    low-conf            → P_fixed + Q_fixed
 
-8. Probe state discarded
+9. Probe state discarded
    original input restarts from Transformer Block 0
 
-9. Evaluation
+10. Evaluation
    evaluate final selected mode and generated result
 ```
 
@@ -1276,6 +1348,6 @@ Fixed 在高置信度 Math/Multi-hop 时覆盖 task mode
 
 ---
 
-# 37. 一句话概括
+# 38. 一句话概括
 
-> **MoiraiBlock 先为 Math 和 Multi-hop 分别发现最适合其深度信息流的连续非均匀 partition，再在冻结 Qwen3 backbone 下为 Math、Multi-hop 和固定 4-layer Block 三种 partition 分别训练独立 pseudo-query；推理时 Probe 高置信度选择对应任务的 `(partition, query)`，低置信度则选择独立训练好的 Fixed Block `(P_fixed,Q_fixed)`，随后丢弃 Probe 状态并从 Transformer Block 0 重新执行正式推理。**
+> **MoiraiBlock 先为 Math、Multi-hop 和 Code 分别发现最适合其深度信息流的连续非均匀 partition，再在冻结 Qwen3 backbone 下为 Math、Multi-hop、Code 和固定 4-layer Block 四种 partition 分别训练独立 pseudo-query；其中 Q_code 只使用合并官方 split 后的 MBPP dataset pool。推理时 Probe 高置信度选择对应任务的 `(partition, query)`，低置信度则选择独立训练好的 Fixed Block `(P_fixed,Q_fixed)`，随后丢弃 Probe 状态并从 Transformer Block 0 重新执行正式推理。**

@@ -4,10 +4,10 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-import torch
 from safetensors.torch import load_file
 
 from src.common import sha256_file
+from src.distributed.fsdp_utils import load_selected_parameter_state
 from src.modeling.partition import MoiraiPartition
 
 
@@ -88,16 +88,11 @@ class MoiraiConfigBundle:
         expected = set(self.trainable_parameters)
         if set(state) != expected:
             raise ValueError("Query checkpoint tensors do not match its manifest")
-        named_parameters = dict(model.named_parameters())
-        if not expected.issubset(named_parameters):
-            missing = sorted(expected - named_parameters.keys())
-            raise ValueError(f"Model is missing query parameters: {missing}")
-        with torch.no_grad():
-            for name in sorted(expected):
-                parameter = named_parameters[name]
-                parameter.copy_(
-                    state[name].to(device=parameter.device, dtype=parameter.dtype)
-                )
+        load_selected_parameter_state(
+            model,
+            state,
+            lambda name, _parameter: "pseudo_query" in name,
+        )
         model.config.attnres_execution = "moirai"
         model.config.moirai_partition = list(self.partition.lengths)
         model.config.moirai_task = self.task

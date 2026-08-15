@@ -30,6 +30,47 @@ def load_local_split(path: str | Path, official_split: str):
     return dataset
 
 
+def dataset_pool_sources(
+    data_config: dict[str, Any],
+    dataset_name: str,
+) -> tuple[dict[str, Any], ...]:
+    candidates: list[dict[str, Any]] = []
+    for section_name in (
+        "sources",
+        "validation_sources",
+        "evaluation_sources",
+        "probe_sources",
+    ):
+        for source in data_config.get(section_name, {}).values():
+            if source.get("dataset_name") == dataset_name:
+                candidates.append(source)
+    unique: dict[tuple[str, str], dict[str, Any]] = {}
+    for source in candidates:
+        key = (str(source["local_path"]), str(source["official_split"]))
+        unique[key] = source
+    if not unique:
+        raise ValueError(f"No configured source pool exists for {dataset_name}")
+    return tuple(unique[key] for key in sorted(unique))
+
+
+def load_dataset_pool(
+    data_config: dict[str, Any],
+    dataset_name: str,
+) -> dict[str, tuple[Any, dict[str, Any]]]:
+    pool: dict[str, tuple[Any, dict[str, Any]]] = {}
+    for source in dataset_pool_sources(data_config, dataset_name):
+        split = str(source["official_split"])
+        if split in pool:
+            raise ValueError(
+                f"Dataset pool {dataset_name} configures split {split!r} more than once"
+            )
+        pool[split] = (
+            load_local_split(source["local_path"], split),
+            source["field_mapping"],
+        )
+    return pool
+
+
 def format_clutrr_prompt(
     row: dict,
     field_mapping: dict[str, Any] | None = None,
@@ -49,7 +90,25 @@ def format_clutrr_prompt(
 TASK_TO_SOURCE = {
     "math": "gsm8k",
     "multihop": "clutrr",
+    "code": "mbpp",
 }
+SUPERVISED_TASKS = tuple(TASK_TO_SOURCE)
+
+
+def task_split_count(
+    data_config: dict[str, Any],
+    *,
+    task: str,
+    split_name: str,
+) -> int:
+    overrides = data_config.get("task_count_overrides", {}).get(task, {})
+    value = overrides.get(split_name, data_config["counts"][split_name])
+    if isinstance(value, dict):
+        value = value[task]
+    count = int(value)
+    if count <= 0:
+        raise ValueError(f"{task}/{split_name} count must be positive")
+    return count
 
 
 def format_task_prompt(
@@ -62,6 +121,11 @@ def format_task_prompt(
         return f"Question: {question}\nAnswer:"
     if task == "multihop":
         return format_clutrr_prompt(row, field_mapping)
+    if task == "code":
+        prompt = str(nested_value(row, str(field_mapping["prompt"]))).strip()
+        if not prompt:
+            raise ValueError("MBPP row requires a non-empty prompt")
+        return f"Problem: {prompt}\nCode:\n"
     raise ValueError(f"Unknown task: {task}")
 
 
@@ -72,7 +136,7 @@ def format_task_target(
 ) -> str:
     if task == "math":
         target = str(nested_value(row, str(field_mapping["target"]))).strip()
-    elif task == "multihop":
+    elif task in {"multihop", "code"}:
         target = str(nested_value(row, str(field_mapping["target"]))).strip()
     else:
         raise ValueError(f"Unknown task: {task}")
@@ -97,6 +161,21 @@ def canonical_content_sha256(
         payload = {
             "question": nested_value(row, str(field_mapping["question"])),
             "target": nested_value(row, str(field_mapping["target"])),
+        }
+    elif dataset_name == "mbpp":
+        payload = {
+            "task_id": nested_value(row, str(field_mapping["id"])),
+            "prompt": nested_value(row, str(field_mapping["prompt"])),
+            "target": nested_value(row, str(field_mapping["target"])),
+            "test_list": nested_value(row, str(field_mapping["test_list"])),
+            "test_setup_code": nested_value(
+                row,
+                str(field_mapping["test_setup_code"]),
+            ),
+            "challenge_test_list": nested_value(
+                row,
+                str(field_mapping["challenge_test_list"]),
+            ),
         }
     else:
         raise ValueError(f"Unsupported dataset for canonical content: {dataset_name}")
@@ -225,7 +304,7 @@ def encode_prompt_target(
             add_special_tokens=False,
         )
         if len(prompt_ids) > prompt_budget:
-            raise ValueError(f"{task} question plus target exceeds the fixed sequence length")
+            raise ValueError(f"{task} prompt plus target exceeds the fixed sequence length")
     tokens = prompt_ids + target_ids
     input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
     labels = torch.tensor(tokens[1:], dtype=torch.long)

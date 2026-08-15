@@ -5,26 +5,46 @@ import gc
 import hashlib
 import json
 import math
-import os
 import random
 from pathlib import Path
 from typing import Any
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from safetensors.torch import save_file
 from transformers import AutoTokenizer
 
-from src.common import config_sha256, load_yaml, sha256_file, tokenizer_sha256
+from src.common import (
+    config_sha256,
+    load_yaml,
+    sha256_file,
+    sha256_json,
+    tokenizer_sha256,
+)
 from src.data.format_tasks import (
+    SUPERVISED_TASKS,
     TASK_TO_SOURCE,
     collate_target_examples,
     encode_prompt_target,
-    load_local_split,
+    load_dataset_pool,
     load_manifest,
 )
-from src.modeling.full_attnres import MoiraiQwen3ForCausalLM
+from src.distributed.fsdp_utils import (
+    DistributedContext,
+    all_reduce_sum,
+    barrier,
+    broadcast_object,
+    clip_grad_norm,
+    destroy_distributed,
+    full_optimizer_state,
+    init_distributed,
+    load_full_optimizer_state,
+    selected_parameter_sha256,
+    selected_parameter_state,
+    trainable_parameter_names,
+    wrap_qwen3_fsdp,
+)
+from src.modeling.full_attnres import MoiraiQwen3DecoderLayer, MoiraiQwen3ForCausalLM
 from src.modeling.partition import MoiraiPartition
 from src.training.checkpointing import (
     pseudo_query_sha256,
@@ -101,15 +121,21 @@ def save_query_checkpoint(
     training_passes: int = 1,
     unique_training_examples: int | None = None,
     processed_training_examples: int | None = None,
+    query_state_override: dict[str, torch.Tensor] | None = None,
+    trainable_override: tuple[str, ...] | None = None,
 ) -> dict:
     if partition.task != task:
         raise ValueError("Task and partition task do not match")
-    trainable = freeze_for_query_training(model)
-    query_state = {
-        name: parameter.detach().cpu().contiguous()
-        for name, parameter in model.named_parameters()
-        if name in trainable
-    }
+    if query_state_override is None:
+        trainable = freeze_for_query_training(model)
+        query_state = {
+            name: parameter.detach().cpu().contiguous()
+            for name, parameter in model.named_parameters()
+            if name in trainable
+        }
+    else:
+        query_state = query_state_override
+        trainable = trainable_override or tuple(sorted(query_state))
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     query_file = output_path / "final_query.safetensors"
@@ -201,17 +227,8 @@ def _checkpoint_weight(checkpoint: Path) -> tuple[Path, str, dict[str, Any]]:
 
 
 def _setup_distributed() -> tuple[int, int, int, torch.device]:
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size <= 0:
-        raise RuntimeError("Stage 3 WORLD_SIZE must be positive")
-    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
-        raise RuntimeError("Stage 3 requires one visible CUDA GPU per process")
-    if not dist.is_initialized():
-        dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    return rank, world_size, local_rank, torch.device("cuda", local_rank)
+    context = init_distributed()
+    return context.rank, context.world_size, context.local_rank, context.device
 
 
 def _load_task_examples(
@@ -225,8 +242,6 @@ def _load_task_examples(
 ):
     source_name = TASK_TO_SOURCE[task]
     source = data_config["sources"][source_name]
-    if split_name == "stage3_adapter_val":
-        source = data_config.get("validation_sources", {}).get(task, source)
     selected = [
         record
         for record in records
@@ -240,17 +255,18 @@ def _load_task_examples(
             f"{task}/{split_name} requires exactly {expected_count} cases, "
             f"found {len(selected)}"
         )
-    dataset = load_local_split(source["local_path"], str(source["official_split"]))
+    pool = load_dataset_pool(data_config, str(source["dataset_name"]))
     examples = []
     invalid: list[dict[str, str]] = []
     for record in selected:
         try:
+            dataset, field_mapping = pool[str(record["official_split"])]
             examples.append(
                 encode_prompt_target(
                     tokenizer,
                     task=task,
                     row=dataset[int(record["row_index"])],
-                    field_mapping=source["field_mapping"],
+                    field_mapping=field_mapping,
                     stable_id=record["stable_id"],
                     max_length=2048,
                 )
@@ -311,33 +327,32 @@ def _validation_loss(
     examples,
     *,
     tokenizer,
-    device: torch.device,
+    context: DistributedContext,
 ) -> tuple[float, int]:
     model.eval()
     total_loss = 0.0
     total_tokens = 0
-    for example in examples:
+    for case_index, example in enumerate(examples):
         batch = collate_target_examples(
             [example],
             pad_token_id=tokenizer.pad_token_id,
         )
-        target_mask = batch.pop("target_mask").to(device)
-        labels = batch.pop("labels").to(device)
-        inputs = {key: value.to(device) for key, value in batch.items()}
+        target_mask = batch.pop("target_mask").to(context.device)
+        labels = batch.pop("labels").to(context.device)
+        if context.rank != case_index % context.world_size:
+            target_mask.zero_()
+        inputs = {key: value.to(context.device) for key, value in batch.items()}
         with torch.autocast("cuda", dtype=torch.bfloat16):
             logits = model(**inputs, use_cache=False).logits
         loss, count = _loss_sum(logits, labels, target_mask)
-        total_loss += float(loss.cpu())
-        total_tokens += count
+        reduced_loss = all_reduce_sum(loss.detach(), context)
+        reduced_count = all_reduce_sum(
+            torch.tensor(count, dtype=torch.long, device=context.device),
+            context,
+        )
+        total_loss += float(reduced_loss.cpu())
+        total_tokens += int(reduced_count.item())
     return total_loss / total_tokens, total_tokens
-
-
-def _query_state(model) -> dict[str, torch.Tensor]:
-    return {
-        name: parameter.detach().cpu().contiguous()
-        for name, parameter in model.named_parameters()
-        if "pseudo_query" in name
-    }
 
 
 def _load_query_state(model, state: dict[str, torch.Tensor]) -> None:
@@ -364,12 +379,12 @@ def train_query_partition(
     train_examples,
     validation_examples,
     tokenizer,
-    rank: int,
-    world_size: int,
-    device: torch.device,
+    context: DistributedContext,
     resume: bool,
-    deepspeed_module,
 ) -> dict[str, Any] | None:
+    rank = context.rank
+    world_size = context.world_size
+    device = context.device
     if not resume and (output_dir / "query_manifest.json").exists():
         raise FileExistsError(
             f"Refusing to overwrite completed adapter without --resume: {output_dir}"
@@ -378,8 +393,11 @@ def train_query_partition(
         checkpoint,
         local_files_only=True,
         torch_dtype=torch.bfloat16,
-    ).to(device)
-    actual_query_names, actual_q_full_hash = pseudo_query_sha256(model)
+        low_cpu_mem_usage=True,
+    )
+    actual_query_names, actual_q_full_hash = pseudo_query_sha256(model) if rank == 0 else (None, None)
+    actual_query_names = broadcast_object(actual_query_names, context)
+    actual_q_full_hash = broadcast_object(actual_q_full_hash, context)
     if actual_query_names != expected_q_full_names:
         raise ValueError("Adapter base Q_full parameter names mismatch")
     if actual_q_full_hash != expected_q_full_hash:
@@ -388,16 +406,21 @@ def train_query_partition(
     model.config.moirai_partition = list(partition.lengths)
     model.config.moirai_task = task
     model.config.use_cache = False
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
     if not resume:
         zero_initialize_pseudo_queries(model)
     freeze_for_query_training(model)
-    _, query_before_hash = pseudo_query_sha256(model)
-    backbone_hash: list[str | None] = [
-        frozen_backbone_sha256(model) if rank == 0 else None
-    ]
-    dist.broadcast_object_list(backbone_hash, src=0)
-    backbone_before = backbone_hash[0]
-    output_dir.mkdir(parents=True, exist_ok=True)
+    _, query_before_hash = pseudo_query_sha256(model) if rank == 0 else (None, None)
+    query_before_hash = broadcast_object(query_before_hash, context)
+    backbone_before = broadcast_object(
+        frozen_backbone_sha256(model) if rank == 0 else None,
+        context,
+    )
+    if rank == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    barrier(context)
     resume_state = None
     if resume:
         state_path = output_dir / "last_state.pt"
@@ -412,6 +435,14 @@ def train_query_partition(
             raise ValueError("Adapter resume partition hash mismatch")
         _load_query_state(model, resume_state["query_state"])
 
+    model = wrap_qwen3_fsdp(
+        model,
+        context,
+        decoder_layer_classes=(MoiraiQwen3DecoderLayer,),
+    )
+    if trainable_parameter_names(model) != tuple(expected_q_full_names):
+        raise RuntimeError("FSDP optimizer parameter set is not exactly pseudo-query")
+
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=float(config["learning_rate"]),
@@ -419,33 +450,6 @@ def train_query_partition(
         eps=float(config["eps"]),
         weight_decay=float(config["weight_decay"]),
     )
-    engine, optimizer, _, _ = deepspeed_module.initialize(
-        model=model,
-        optimizer=optimizer,
-        config={
-            "train_micro_batch_size_per_gpu": int(
-                config["micro_batch_size_per_gpu"]
-            ),
-            "gradient_accumulation_steps": int(
-                config["gradient_accumulation_steps"]
-            ),
-            "train_batch_size": (
-                int(config["micro_batch_size_per_gpu"])
-                * int(config["gradient_accumulation_steps"])
-                * world_size
-            ),
-            "bf16": {"enabled": True},
-            "zero_optimization": {
-                "stage": 2,
-                "overlap_comm": True,
-                "contiguous_gradients": True,
-            },
-            "gradient_clipping": float(config["gradient_clip_norm"]),
-            "steps_per_print": 1,
-        },
-    )
-    if world_size != 1:
-        raise RuntimeError("One-pass query training requires the configured single GPU")
     pass_examples = list(train_examples)
     random.Random(int(config["seed"])).shuffle(pass_examples)
     stable_ids = [example.stable_id for example in pass_examples]
@@ -471,21 +475,7 @@ def train_query_partition(
     global_step = 0
     checkpoint_interval_steps = int(config["checkpoint_interval_steps"])
     if resume_state is not None:
-        load_path, client_state = engine.load_checkpoint(
-            str(output_dir / "deepspeed")
-        )
-        if load_path is None:
-            raise RuntimeError("Adapter DeepSpeed resume checkpoint is missing")
-        if int(client_state["trained_tokens"]) != int(
-            resume_state["trained_tokens"]
-        ):
-            raise ValueError("Adapter resume token counts differ")
-        if client_state.get("training_token_unit") != TRAINING_TOKEN_UNIT:
-            raise ValueError("Adapter DeepSpeed resume training token unit mismatch")
-        if int(client_state["processed_nonpadding_tokens"]) != int(
-            resume_state["processed_nonpadding_tokens"]
-        ):
-            raise ValueError("Adapter resume processed token counts differ")
+        load_full_optimizer_state(model, optimizer, resume_state["optimizer_state"])
         if int(resume_state["maximum_training_examples"]) != maximum_examples:
             raise ValueError("Adapter resume one-pass example count differs")
         if int(resume_state["planned_training_tokens"]) != maximum_tokens:
@@ -511,7 +501,7 @@ def train_query_partition(
     progress_path = output_dir / "training_progress.json"
     last_gradient_norm = 0.0
     while global_step < maximum_examples:
-        engine.train()
+        model.train()
         example = pass_examples[global_step]
         batch = collate_target_examples(
             [example],
@@ -519,35 +509,42 @@ def train_query_partition(
         )
         target_mask = batch.pop("target_mask").to(device)
         labels = batch.pop("labels").to(device)
-        local_nonpadding_count = nonpadding_token_count(batch["attention_mask"])
+        active = rank == global_step % world_size
+        if not active:
+            target_mask.zero_()
+        local_nonpadding_count = (
+            nonpadding_token_count(batch["attention_mask"]) if active else 0
+        )
         input_count_tensor = torch.tensor(
             local_nonpadding_count,
             device=device,
             dtype=torch.long,
         )
-        dist.all_reduce(input_count_tensor)
+        all_reduce_sum(input_count_tensor, context)
         global_nonpadding_count = int(input_count_tensor.item())
         inputs = {key: value.to(device) for key, value in batch.items()}
-        engine.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            logits = engine(**inputs, use_cache=False).logits
+            logits = model(**inputs, use_cache=False).logits
         local_loss, local_count = _loss_sum(logits, labels, target_mask)
         count_tensor = torch.tensor(local_count, device=device, dtype=torch.long)
-        dist.all_reduce(count_tensor)
+        all_reduce_sum(count_tensor, context)
         global_count = int(count_tensor.item())
         if global_count == 0:
             raise RuntimeError("Adapter batch has no target tokens")
         loss = local_loss * world_size / global_count
-        engine.backward(loss)
-        engine.step()
-        gradient_norm = engine.get_global_grad_norm()
-        if gradient_norm is None:
-            raise RuntimeError("DeepSpeed did not report a pseudo-query gradient norm")
+        loss.backward()
+        gradient_norm = clip_grad_norm(
+            model,
+            (parameter for parameter in model.parameters() if parameter.requires_grad),
+            float(config["gradient_clip_norm"]),
+        )
         if isinstance(gradient_norm, torch.Tensor):
             gradient_norm = gradient_norm.detach().float().cpu().item()
         last_gradient_norm = float(gradient_norm)
         if not math.isfinite(last_gradient_norm) or last_gradient_norm <= 0.0:
             raise FloatingPointError("Adapter gradient norm is not positive and finite")
+        optimizer.step()
         processed_nonpadding_tokens += global_nonpadding_count
         trained_tokens += global_nonpadding_count
         global_step += 1
@@ -576,13 +573,21 @@ def train_query_partition(
             global_step % checkpoint_interval_steps == 0
             and global_step < maximum_examples
         ):
+            query_state = selected_parameter_state(
+                model,
+                context,
+                lambda name, _parameter: "pseudo_query" in name,
+            )
+            optimizer_state = full_optimizer_state(model, optimizer, context)
             if rank == 0:
+                assert query_state is not None and optimizer_state is not None
                 torch.save(
                     {
                         "run_config_sha256": run_config_hash,
                         "base_checkpoint_sha256": base_checkpoint_hash,
                         "partition_sha256": partition.sha256,
-                        "query_state": _query_state(engine.module),
+                        "query_state": query_state,
+                        "optimizer_state": optimizer_state,
                         "scheduler": scheduler.state_dict(),
                         "trained_tokens": trained_tokens,
                         "processed_nonpadding_tokens": processed_nonpadding_tokens,
@@ -593,46 +598,43 @@ def train_query_partition(
                     },
                     output_dir / "last_state.pt",
                 )
-            engine.save_checkpoint(
-                str(output_dir / "deepspeed"),
-                tag="recovery",
-                client_state={
-                    "trained_tokens": trained_tokens,
-                    "processed_nonpadding_tokens": processed_nonpadding_tokens,
-                    "training_token_unit": TRAINING_TOKEN_UNIT,
-                    "global_step": global_step,
-                },
-            )
-            dist.barrier()
+            barrier(context)
 
     if global_step != maximum_examples:
         raise RuntimeError("One-pass query training did not consume every example")
     if trained_tokens != maximum_tokens:
         raise RuntimeError("One-pass query training token total changed during execution")
 
-    validation_result: list[tuple[float, int] | None] = [None]
-    if rank == 0:
-        validation_result[0] = _validation_loss(
-            engine,
-            validation_examples,
-            tokenizer=tokenizer,
-            device=device,
-        )
-    dist.broadcast_object_list(validation_result, src=0)
-    validation_loss, _ = validation_result[0]
-    backbone_hash = [
-        frozen_backbone_sha256(engine.module) if rank == 0 else None
-    ]
-    dist.broadcast_object_list(backbone_hash, src=0)
-    backbone_after = backbone_hash[0]
+    validation_loss, _ = _validation_loss(
+        model,
+        validation_examples,
+        tokenizer=tokenizer,
+        context=context,
+    )
+    backbone_after = selected_parameter_sha256(
+        model,
+        context,
+        lambda name, _parameter: "pseudo_query" not in name,
+    )
     if backbone_after != backbone_before:
         raise RuntimeError("FAILED_FROZEN_BACKBONE_CHECK")
+    query_state = selected_parameter_state(
+        model,
+        context,
+        lambda name, _parameter: "pseudo_query" in name,
+    )
     if rank == 0:
-        _, query_after_hash = pseudo_query_sha256(engine.module)
+        assert query_state is not None
+        query_after_hash = sha256_json(
+            {
+                name: tensor.detach().float().cpu().tolist()
+                for name, tensor in query_state.items()
+            }
+        )
         if query_after_hash == query_before_hash:
             raise RuntimeError("Adapter optimizer steps did not change pseudo-query")
         return save_query_checkpoint(
-            engine.module,
+            model,
             output_dir,
             task=task,
             partition=partition,
@@ -654,6 +656,8 @@ def train_query_partition(
             training_passes=1,
             unique_training_examples=maximum_examples,
             processed_training_examples=global_step,
+            query_state_override=query_state,
+            trainable_override=tuple(expected_q_full_names),
         )
     return None
 
@@ -666,7 +670,7 @@ def validate_query_training_protocol(
     expected = {
         "seed": 42,
         "precision": "bf16",
-        "distributed": "torchrun_deepspeed_zero2",
+        "distributed": "torchrun_fsdp_full_shard",
         "use_cache": False,
         "trainable_parameters": "pseudo_query_only",
         "optimizer": "AdamW",
@@ -691,16 +695,21 @@ def validate_query_training_protocol(
     for key in (
         "checkpoint_interval_steps",
         "progress_interval_steps",
-        "training_cases_per_task",
     ):
         if int(config.get(key, 0)) <= 0:
             raise ValueError(f"{stage_name} {key} must be positive")
+    if "training_cases_per_task" not in config:
+        raise ValueError(f"{stage_name} training_cases_per_task is missing")
 
 
 def validate_adapter_config(config: dict[str, Any]) -> None:
     validate_query_training_protocol(config, stage_name="Stage 3")
-    if int(config["training_cases_per_task"]) != 200:
-        raise ValueError("Math/Multihop query training requires 200 cases per task")
+    expected_case_counts = {"math": 1000, "multihop": 1000, "code": 200}
+    if config.get("training_cases_per_task") != expected_case_counts:
+        raise ValueError(
+            "Task query training case counts must be "
+            f"{expected_case_counts!r}"
+        )
     for key in {
         "base_checkpoint",
         "data_manifest",
@@ -714,7 +723,7 @@ def validate_adapter_config(config: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", required=True, choices=["math", "multihop"])
+    parser.add_argument("--task", required=True, choices=SUPERVISED_TASKS)
     parser.add_argument("--config", default="configs/stage3_adapter.yaml")
     parser.add_argument("--resume", nargs="?", const="auto", default="")
     parser.add_argument("--checkpoint", default="")
@@ -728,9 +737,14 @@ def main() -> None:
     args = parse_args()
     config = load_yaml(args.config)
     validate_adapter_config(config)
+    context = init_distributed()
     run_config_hash = config_sha256(args.config)
     checkpoint = Path(args.checkpoint or config["base_checkpoint"])
-    _, base_checkpoint_hash, checkpoint_manifest = _checkpoint_weight(checkpoint)
+    checkpoint_identity = broadcast_object(
+        _checkpoint_weight(checkpoint) if context.is_rank0 else None,
+        context,
+    )
+    _, base_checkpoint_hash, checkpoint_manifest = checkpoint_identity
     partition_root = Path(args.partition_root or config["partition_root"])
     output_root = Path(args.output_root or config["output_root"])
     data_manifest_path = Path(args.data_manifest or config["data_manifest"])
@@ -757,7 +771,7 @@ def main() -> None:
         records=records,
         data_config=data_config,
         tokenizer=tokenizer,
-        expected_count=int(config["training_cases_per_task"]),
+        expected_count=int(config["training_cases_per_task"][args.task]),
     )
     validation_examples, _ = _load_task_examples(
         task=args.task,
@@ -766,19 +780,9 @@ def main() -> None:
         data_config=data_config,
         tokenizer=tokenizer,
     )
-    rank, world_size, _, device = _setup_distributed()
-    os.environ.setdefault("XDG_CACHE_HOME", "/tmp/moiraiblock-xdg-cache")
-    os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/moiraiblock-triton-cache")
-    os.environ.setdefault("DS_SKIP_CUDA_CHECK", "1")
-    try:
-        import deepspeed
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Formal Stage 3 requires DeepSpeed; install requirements.txt"
-        ) from exc
-    random.seed(int(config["seed"]) + rank)
-    torch.manual_seed(int(config["seed"]) + rank)
-    torch.cuda.manual_seed_all(int(config["seed"]) + rank)
+    random.seed(int(config["seed"]))
+    torch.manual_seed(int(config["seed"]))
+    torch.cuda.manual_seed_all(int(config["seed"]))
     output_dir = output_root / args.task
     state_path = output_dir / "last_state.pt"
     if args.resume == "auto":
@@ -804,15 +808,13 @@ def main() -> None:
         train_examples=train_examples,
         validation_examples=validation_examples,
         tokenizer=tokenizer,
-        rank=rank,
-        world_size=world_size,
-        device=device,
+        context=context,
         resume=resume_task,
-        deepspeed_module=deepspeed,
     )
-    dist.barrier()
+    barrier(context)
     gc.collect()
     torch.cuda.empty_cache()
+    destroy_distributed(context)
 
 
 if __name__ == "__main__":

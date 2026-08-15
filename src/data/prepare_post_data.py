@@ -10,10 +10,12 @@ from src.common import canonical_json, load_yaml
 from src.data.format_tasks import (
     TASK_TO_SOURCE,
     canonical_content_sha256,
+    dataset_pool_sources,
     load_local_split,
     nested_value,
+    task_split_count,
 )
-from src.data.leakage_audit import audit_manifest
+from src.data.leakage_audit import audit_manifest, normalize_stage_overlap_pairs
 
 
 def _stable_id(
@@ -96,6 +98,36 @@ def _entry(
     }
 
 
+def _ordered_unique_pool(
+    data_config: dict[str, Any],
+    *,
+    task: str,
+    dataset_name: str,
+    seed: int,
+) -> list[tuple[str, dict[str, Any], str, int, dict[str, Any]]]:
+    rows: list[tuple[str, dict[str, Any], str, int, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for source in dataset_pool_sources(data_config, dataset_name):
+        split = str(source["official_split"])
+        dataset = _load_source(source)
+        for row_index in range(len(dataset)):
+            row = dataset[row_index]
+            stable_id = _stable_id(
+                dataset_name=str(source["dataset_name"]),
+                split=split,
+                row=row,
+                mapping=source["field_mapping"],
+            )
+            if stable_id in seen:
+                continue
+            seen.add(stable_id)
+            rows.append(
+                (_order_key(seed, stable_id), source, split, row_index, row)
+            )
+    rows.sort(key=lambda value: value[0])
+    return rows
+
+
 def _ordered_unique(
     dataset,
     *,
@@ -104,6 +136,7 @@ def _ordered_unique(
     split: str,
     seed: int,
 ) -> list[tuple[str, int, dict[str, Any]]]:
+    del task
     rows: list[tuple[str, int, dict[str, Any]]] = []
     seen: set[str] = set()
     for row_index in range(len(dataset)):
@@ -125,20 +158,19 @@ def _ordered_unique(
 def _append_assignments(
     *,
     entries: list[dict[str, Any]],
-    used_content_hashes: set[str],
-    rows: list[tuple[str, int, dict[str, Any]]],
+    stable_id_splits: dict[str, set[str]],
+    content_hash_splits: dict[str, set[str]],
+    allowed_overlap_pairs: frozenset[frozenset[str]],
+    rows: list[tuple[str, dict[str, Any], str, int, dict[str, Any]]],
     assignments: tuple[tuple[str, int], ...],
     task: str,
-    source: dict[str, Any],
-    split: str,
     seed: int,
 ) -> None:
-    cursor = 0
     for assigned_split, count in assignments:
         selected = 0
-        while selected < count and cursor < len(rows):
-            _, row_index, row = rows[cursor]
-            cursor += 1
+        for _, source, split, row_index, row in rows:
+            if selected == count:
+                break
             entry = _entry(
                 task=task,
                 source=source,
@@ -148,14 +180,26 @@ def _append_assignments(
                 assigned_split=assigned_split,
                 seed=seed,
             )
-            if entry["content_sha256"] in used_content_hashes:
+            existing_id_splits = stable_id_splits.get(entry["stable_id"], set())
+            existing_content_splits = content_hash_splits.get(
+                entry["content_sha256"],
+                set(),
+            )
+            if any(
+                other == assigned_split
+                or frozenset((other, assigned_split)) not in allowed_overlap_pairs
+                for other in existing_id_splits | existing_content_splits
+            ):
                 continue
             entries.append(entry)
-            used_content_hashes.add(entry["content_sha256"])
+            stable_id_splits.setdefault(entry["stable_id"], set()).add(assigned_split)
+            content_hash_splits.setdefault(entry["content_sha256"], set()).add(
+                assigned_split
+            )
             selected += 1
         if selected != count:
             raise RuntimeError(
-                f"{task}/{assigned_split} needs {count} non-overlapping rows, "
+                f"{task}/{assigned_split} needs {count} unique eligible rows, "
                 f"found {selected}"
             )
 
@@ -167,127 +211,91 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
     output_dir = Path(config["output_dir"])
     manifest_path = output_dir / "splits.json"
     entries: list[dict[str, Any]] = []
-    used_content_hashes: set[str] = set()
+    stable_id_splits: dict[str, set[str]] = {}
+    content_hash_splits: dict[str, set[str]] = {}
+    configured_overlap_pairs = config.get("allowed_cross_stage_reuse", [])
+    allowed_overlap_pairs = normalize_stage_overlap_pairs(configured_overlap_pairs)
+    expected_overlap_pairs = normalize_stage_overlap_pairs(
+        (("stage2_discovery", "stage3_adapter_train"),)
+    )
+    if allowed_overlap_pairs != expected_overlap_pairs:
+        raise ValueError(
+            "Only Discovery/Query Training cross-stage reuse may be configured"
+        )
     report: dict[str, Any] = {"tasks": {}, "counts": counts}
     discovery_sources = config["discovery_sources"]
 
     for task, source_key in TASK_TO_SOURCE.items():
         source = config["sources"][source_key]
-        dataset = _load_source(source)
-        train_split = str(source["official_split"])
-        train_rows = _ordered_unique(
-            dataset,
+        pool_rows = _ordered_unique_pool(
+            config,
             task=task,
-            source=source,
-            split=train_split,
+            dataset_name=str(source["dataset_name"]),
             seed=seed,
         )
-        validation_source = config.get("validation_sources", {}).get(task)
-        if validation_source is None:
-            train_assignments = (
-                (
-                    "stage2_discovery",
-                    int(discovery_sources[task].get(source_key, 0)),
+        primary_assignments = (
+            (
+                "stage2_discovery",
+                int(discovery_sources[task].get(source_key, 0)),
+            ),
+            (
+                "stage3_adapter_train",
+                task_split_count(
+                    config,
+                    task=task,
+                    split_name="stage3_adapter_train",
                 ),
-                ("stage3_adapter_train", int(counts["stage3_adapter_train"])),
-                ("stage3_adapter_val", int(counts["stage3_adapter_val"])),
-                ("probe_train", int(counts["probe_train"])),
-                ("probe_val", int(counts["probe_val"])),
-            )
-        else:
-            train_assignments = (
-                (
-                    "stage2_discovery",
-                    int(discovery_sources[task].get(source_key, 0)),
+            ),
+            (
+                "stage3_adapter_val",
+                task_split_count(
+                    config,
+                    task=task,
+                    split_name="stage3_adapter_val",
                 ),
-                ("stage3_adapter_train", int(counts["stage3_adapter_train"])),
-                ("probe_train", int(counts["probe_train"])),
-            )
-        required = sum(count for _, count in train_assignments)
-        if len(train_rows) < required:
-            raise RuntimeError(
-                f"{task} train needs {required} unique rows, got {len(train_rows)}"
-            )
+            ),
+            (
+                "probe_train",
+                task_split_count(config, task=task, split_name="probe_train"),
+            ),
+            (
+                "probe_val",
+                task_split_count(config, task=task, split_name="probe_val"),
+            ),
+        )
         _append_assignments(
             entries=entries,
-            used_content_hashes=used_content_hashes,
-            rows=train_rows,
-            assignments=train_assignments,
+            stable_id_splits=stable_id_splits,
+            content_hash_splits=content_hash_splits,
+            allowed_overlap_pairs=allowed_overlap_pairs,
+            rows=pool_rows,
+            assignments=primary_assignments,
             task=task,
-            source=source,
-            split=train_split,
             seed=seed,
         )
 
-        validation_available = len(train_rows)
-        validation_assignments: tuple[tuple[str, int], ...] = ()
-        if validation_source is not None:
-            validation_dataset = _load_source(validation_source)
-            validation_split = str(validation_source["official_split"])
-            validation_rows = _ordered_unique(
-                validation_dataset,
-                task=task,
-                source=validation_source,
-                split=validation_split,
-                seed=seed,
-            )
-            validation_assignments = (
-                ("stage3_adapter_val", int(counts["stage3_adapter_val"])),
-                ("probe_val", int(counts["probe_val"])),
-            )
-            required_validation = sum(
-                count for _, count in validation_assignments
-            )
-            if len(validation_rows) < required_validation:
-                raise RuntimeError(
-                    f"{task} validation needs {required_validation} unique rows, "
-                    f"got {len(validation_rows)}"
-                )
-            _append_assignments(
-                entries=entries,
-                used_content_hashes=used_content_hashes,
-                rows=validation_rows,
-                assignments=validation_assignments,
-                task=task,
-                source=validation_source,
-                split=validation_split,
-                seed=seed,
-            )
-            validation_available = len(validation_rows)
-
-        evaluation = config["evaluation_sources"][task]
-        evaluation_dataset = _load_source(evaluation)
-        evaluation_split = str(evaluation["official_split"])
-        evaluation_rows = _ordered_unique(
-            evaluation_dataset,
+        evaluation_count = task_split_count(
+            config,
             task=task,
-            source=evaluation,
-            split=evaluation_split,
-            seed=seed,
+            split_name="stage4_final_eval",
         )
-        evaluation_count = int(counts["stage4_final_eval"])
-        if len(evaluation_rows) < evaluation_count:
-            raise RuntimeError(
-                f"{task} evaluation needs {evaluation_count} rows, "
-                f"got {len(evaluation_rows)}"
-            )
         _append_assignments(
             entries=entries,
-            used_content_hashes=used_content_hashes,
-            rows=evaluation_rows,
+            stable_id_splits=stable_id_splits,
+            content_hash_splits=content_hash_splits,
+            allowed_overlap_pairs=allowed_overlap_pairs,
+            rows=pool_rows,
             assignments=(("stage4_final_eval", evaluation_count),),
             task=task,
-            source=evaluation,
-            split=evaluation_split,
             seed=seed,
         )
         report["tasks"][task] = {
-            "train_available": len(train_rows),
-            "validation_available": validation_available,
-            "evaluation_available": len(evaluation_rows),
+            "pool_available": len(pool_rows),
+            "pool_official_splits": sorted(
+                {split for _, _, split, _, _ in pool_rows}
+            ),
             "selected": {
-                **dict(train_assignments),
-                **dict(validation_assignments),
+                **dict(primary_assignments),
                 "stage2_discovery": int(counts["stage2_discovery"][task]),
                 "stage2_discovery_by_source": discovery_sources[task],
                 "stage4_final_eval": evaluation_count,
@@ -300,13 +308,10 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
             if source_key == primary_source:
                 continue
             source = config["sources"][source_key]
-            split = str(source["official_split"])
-            dataset = _load_source(source)
-            rows = _ordered_unique(
-                dataset,
+            rows = _ordered_unique_pool(
+                config,
                 task=task,
-                source=source,
-                split=split,
+                dataset_name=str(source["dataset_name"]),
                 seed=seed,
             )
             count = int(requested_count)
@@ -317,12 +322,12 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
                 )
             _append_assignments(
                 entries=entries,
-                used_content_hashes=used_content_hashes,
+                stable_id_splits=stable_id_splits,
+                content_hash_splits=content_hash_splits,
+                allowed_overlap_pairs=allowed_overlap_pairs,
                 rows=rows,
                 assignments=(("stage2_discovery", count),),
                 task=task,
-                source=source,
-                split=split,
                 seed=seed,
             )
 
@@ -333,7 +338,10 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
         for entry in entries:
             handle.write(canonical_json(entry) + "\n")
     temporary.replace(manifest_path)
-    leakage = audit_manifest(manifest_path)
+    leakage = audit_manifest(
+        manifest_path,
+        allowed_cross_stage_reuse=configured_overlap_pairs,
+    )
     if leakage["status"] != "PASS":
         raise RuntimeError("Generated post-training manifest contains data leakage")
     report.update(

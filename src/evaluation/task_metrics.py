@@ -3,6 +3,9 @@ from __future__ import annotations
 import collections
 import re
 import string
+import subprocess
+import sys
+import tempfile
 from typing import Any
 
 
@@ -76,16 +79,68 @@ def math_exact_match(prediction: str, gold: str) -> float:
     )
 
 
+_CODE_FENCE_PATTERN = re.compile(
+    r"```(?:python)?\s*(.*?)```",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def extract_code(prediction: str) -> str:
+    match = _CODE_FENCE_PATTERN.search(prediction)
+    return (match.group(1) if match else prediction).strip()
+
+
+def mbpp_accuracy(
+    prediction: str,
+    *,
+    test_list: list[str],
+    test_setup_code: str,
+    timeout_seconds: float = 5.0,
+) -> float:
+    code = extract_code(prediction)
+    if not code or not test_list:
+        return 0.0
+    source = "\n".join(
+        value
+        for value in (test_setup_code.strip(), code, *test_list)
+        if value
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="moiraiblock-mbpp-") as directory:
+            completed = subprocess.run(
+                [sys.executable, "-I", "-c", source],
+                cwd=directory,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_seconds,
+                check=False,
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0.0
+    return float(completed.returncode == 0)
+
+
 def task_score(
     task: str,
     prediction: str,
     *,
     gold: str,
+    test_list: list[str] | None = None,
+    test_setup_code: str = "",
 ) -> dict[str, float]:
     if task == "math":
         return {"accuracy": math_exact_match(prediction, gold)}
     if task == "multihop":
         return clutrr_metrics(prediction, gold)
+    if task == "code":
+        return {
+            "accuracy": mbpp_accuracy(
+                prediction,
+                test_list=test_list or [],
+                test_setup_code=test_setup_code,
+            )
+        }
     raise ValueError(f"Unknown task: {task}")
 
 

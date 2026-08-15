@@ -34,7 +34,7 @@ def test_independent_baseline_configs_are_exactly_one_pass() -> None:
         assert config["selection_order"] == "stable_id"
     assert full["fixed_partition"] is None
     assert fixed["fixed_partition"] == FIXED_PARTITION
-    assert sum(fixed["fixed_partition"]) == 28
+    assert sum(fixed["fixed_partition"]) == 40
 
 
 def test_each_baseline_has_one_shared_query_output() -> None:
@@ -137,7 +137,7 @@ def _tiny_28_layer_model(execution: str) -> BaselineQwen3Model:
             max_position_embeddings=32,
             layer_types=["full_attention"] * 28,
             baseline_execution=execution,
-            baseline_partition=None if execution == "full" else FIXED_PARTITION,
+            baseline_partition=None if execution == "full" else [4] * 7,
             use_cache=False,
         )
     ).eval()

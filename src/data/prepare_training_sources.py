@@ -5,10 +5,13 @@ import csv
 import json
 import os
 import shutil
+import ssl
 import tempfile
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+import certifi
 
 # The Hub's Xet transport can stall on large parquet files in restricted runners.
 # Plain HTTP preserves the exact repository revision and supports the same cache.
@@ -51,6 +54,24 @@ CLUTRR_FEATURES = Features(
         for field in CLUTRR_FIELDS
     }
 )
+MBPP_FIELDS = {
+    "stable_id",
+    "task_id",
+    "official_split",
+    "prompt",
+    "target",
+    "test_list",
+    "test_setup_code",
+    "challenge_test_list",
+}
+
+
+def _urlopen(request: urllib.request.Request):
+    return urllib.request.urlopen(
+        request,
+        timeout=600,
+        context=ssl.create_default_context(cafile=certifi.where()),
+    )
 
 
 def _required_fields(source: dict[str, Any]) -> list[str]:
@@ -65,6 +86,10 @@ def _required_fields(source: dict[str, Any]) -> list[str]:
             "target",
             "context",
             "answer",
+            "prompt",
+            "test_list",
+            "test_setup_code",
+            "challenge_test_list",
         )
         if mapping.get(key)
     ]
@@ -85,6 +110,13 @@ def _validate_local_source(source: dict[str, Any]) -> int:
             )
         if dataset.features != CLUTRR_FEATURES:
             raise RuntimeError("Local CLUTRR schema does not match official HF schema")
+    if source["dataset_name"] == "mbpp":
+        if set(dataset.column_names) != MBPP_FIELDS:
+            raise RuntimeError(
+                "Local MBPP schema does not match the validated preprocessing schema"
+            )
+        if set(dataset.unique("official_split")) != {source["official_split"]}:
+            raise RuntimeError("Local MBPP rows do not match their official split")
     expected_rows = source.get("expected_rows")
     if expected_rows is not None and len(dataset) != int(expected_rows):
         raise RuntimeError(
@@ -98,7 +130,7 @@ def _download_svamp(source: dict[str, Any]) -> Dataset:
         source["source_url"],
         headers={"User-Agent": "MoiraiBlock-post-training"},
     )
-    with urllib.request.urlopen(request, timeout=600) as response:
+    with _urlopen(request) as response:
         payload = json.load(response)
     if not isinstance(payload, list):
         raise TypeError("Official SVAMP JSON must contain a list")
@@ -136,7 +168,7 @@ def _download_clutrr(source: dict[str, Any]) -> DatasetDict:
             str(url),
             headers={"User-Agent": "MoiraiBlock-post-training"},
         )
-        with urllib.request.urlopen(request, timeout=600) as response:
+        with _urlopen(request) as response:
             reader = csv.DictReader(
                 line.decode("utf-8-sig") for line in response
             )

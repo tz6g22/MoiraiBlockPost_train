@@ -12,17 +12,26 @@ from transformers import AutoTokenizer
 from src.common import load_yaml, sha256_file, sha256_json, tokenizer_sha256
 from src.data.format_tasks import (
     PromptOnlyExample,
+    SUPERVISED_TASKS,
     TASK_TO_SOURCE,
-    load_local_split,
+    encode_prompt_only,
+    load_dataset_pool,
     load_manifest,
+    task_split_count,
 )
-from src.data.streams import ManifestTaskRows
+from src.distributed.fsdp_utils import (
+    barrier,
+    broadcast_object,
+    destroy_distributed,
+    init_distributed,
+    wrap_qwen3_fsdp,
+)
 from src.modeling.config_bundle import MoiraiConfigBundle
-from src.modeling.full_attnres import MoiraiQwen3ForCausalLM
+from src.modeling.full_attnres import MoiraiQwen3DecoderLayer, MoiraiQwen3ForCausalLM
 from src.training.checkpointing import validate_post_training_base_manifest
 
 
-CLASS_TO_TASK = {0: "math", 1: "multihop"}
+CLASS_TO_TASK = dict(enumerate(SUPERVISED_TASKS))
 TASK_TO_CLASS = {task: index for index, task in CLASS_TO_TASK.items()}
 
 
@@ -46,7 +55,8 @@ def validate_probe_config(config: dict[str, Any]) -> None:
         "probe_entry_task": "math",
         "feature_site": "transformer_block_0_output",
         "pooling": "mask_aware_mean",
-        "classifier": "Linear(1024,2)",
+        "classifier": "Linear(5120,3)",
+        "confidence_threshold": 0.5,
         "max_epochs": 20,
         "learning_rate": 1.0e-3,
         "weight_decay": 1.0e-4,
@@ -61,7 +71,7 @@ def validate_probe_config(config: dict[str, Any]) -> None:
         if int(config.get(key, 0)) <= 0:
             raise ValueError(f"Probe {key} must be positive")
     if config.get("classes") != CLASS_TO_TASK:
-        raise ValueError("Probe classes must be exactly math/multihop")
+        raise ValueError("Probe classes must be exactly math/multihop/code")
     for key in {
         "base_checkpoint",
         "data_manifest",
@@ -104,11 +114,6 @@ def _prompt_examples(
         else:
             source_key = TASK_TO_SOURCE[task]
             source = data_config["sources"][source_key]
-            if split_name == "probe_val":
-                source = data_config.get("validation_sources", {}).get(
-                    task,
-                    source,
-                )
         dataset_name = str(source.get("dataset_name", source_key))
         selected = [
             record
@@ -121,20 +126,30 @@ def _prompt_examples(
         expected = (
             int(expected_per_class)
             if expected_per_class is not None
-            else int(data_config["counts"][split_name])
+            else task_split_count(
+                data_config,
+                task=task,
+                split_name=split_name,
+            )
         )
         if len(selected) != expected:
             raise RuntimeError(
                 f"{task} {split_name} requires {expected} examples, found {len(selected)}"
             )
-        dataset = load_local_split(source["local_path"], str(source["official_split"]))
-        rows = ManifestTaskRows(
-            task=task,
-            records=tuple(selected),
-            dataset=dataset,
-            field_mapping=source["field_mapping"],
-        )
-        task_examples = rows.prompt_examples(tokenizer, max_length=2048)
+        pool = load_dataset_pool(data_config, dataset_name)
+        task_examples = []
+        for record in selected:
+            dataset, field_mapping = pool[str(record["official_split"])]
+            task_examples.append(
+                encode_prompt_only(
+                    tokenizer,
+                    task=task,
+                    row=dataset[int(record["row_index"])],
+                    field_mapping=field_mapping,
+                    stable_id=str(record["stable_id"]),
+                    max_length=2048,
+                )
+            )
         examples.extend(task_examples)
         labels.extend([TASK_TO_CLASS[task]] * len(task_examples))
     return examples, labels
@@ -189,12 +204,13 @@ def extract_split_features(
             dtype=torch.bfloat16,
             enabled=device.type == "cuda",
         ):
-            shallow = model.model(
+            shallow_output = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 use_cache=False,
                 probe_layer0_only=True,
-            ).last_hidden_state
+            )
+            shallow = shallow_output.probe_hidden_state
         mask = attention_mask.unsqueeze(-1).to(shallow.dtype)
         pooled = (shallow * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
         if not torch.isfinite(pooled).all():
@@ -247,9 +263,13 @@ def main() -> None:
     args = parse_args()
     config = apply_probe_overrides(load_yaml(args.config), args)
     validate_probe_config(config)
+    context = init_distributed()
     run_config_hash = sha256_json(config)
     checkpoint = Path(config["base_checkpoint"])
-    base_hash = _weight_hash(checkpoint)
+    base_hash = broadcast_object(
+        _weight_hash(checkpoint) if context.is_rank0 else None,
+        context,
+    )
     probe_entry_bundle = load_task_bundle(
         config,
         task="math",
@@ -286,19 +306,22 @@ def main() -> None:
     )
     output_dir = Path(config["output_dir"])
     feature_manifest_path = output_dir / "feature_manifest.json"
-    if not torch.cuda.is_available():
-        raise RuntimeError("Formal Probe feature extraction requires CUDA")
-    device = torch.device("cuda:0")
     model = MoiraiQwen3ForCausalLM.from_pretrained(
         checkpoint,
         local_files_only=True,
         torch_dtype=torch.bfloat16,
-    ).to(device)
+        low_cpu_mem_usage=True,
+    )
     probe_entry_bundle.apply_to_model(model)
     if model.config.attnres_execution != "moirai" or model.config.moirai_task != "math":
         raise RuntimeError("Probe entry did not load Config_math")
     for parameter in model.parameters():
         parameter.requires_grad_(False)
+    model = wrap_qwen3_fsdp(
+        model,
+        context,
+        decoder_layer_classes=(MoiraiQwen3DecoderLayer,),
+    )
 
     train_features, train_label_tensor, _ = extract_split_features(
         model,
@@ -306,7 +329,7 @@ def main() -> None:
         train_labels,
         tokenizer=tokenizer,
         batch_size=int(config["feature_batch_size"]),
-        device=device,
+        device=context.device,
     )
     val_features, val_label_tensor, _ = extract_split_features(
         model,
@@ -314,8 +337,12 @@ def main() -> None:
         validation_labels,
         tokenizer=tokenizer,
         batch_size=int(config["feature_batch_size"]),
-        device=device,
+        device=context.device,
     )
+    if not context.is_rank0:
+        barrier(context)
+        destroy_distributed(context)
+        return
     output_dir.mkdir(parents=True, exist_ok=True)
     train_file = output_dir / "train_features.safetensors"
     val_file = output_dir / "validation_features.safetensors"
@@ -335,6 +362,14 @@ def main() -> None:
                 "validation_feature_sha256": sha256_file(val_file),
                 "train_examples": len(train_examples),
                 "validation_examples": len(validation_examples),
+                "train_examples_by_class": {
+                    task: train_labels.count(class_index)
+                    for class_index, task in CLASS_TO_TASK.items()
+                },
+                "validation_examples_by_class": {
+                    task: validation_labels.count(class_index)
+                    for class_index, task in CLASS_TO_TASK.items()
+                },
             },
             ensure_ascii=False,
             indent=2,
@@ -342,6 +377,8 @@ def main() -> None:
         + "\n",
         encoding="utf-8",
     )
+    barrier(context)
+    destroy_distributed(context)
 
 
 if __name__ == "__main__":

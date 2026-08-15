@@ -79,7 +79,9 @@ def convert_hf_model(
         low_cpu_mem_usage=True,
     )
     model = MoiraiQwen3ForCausalLM(_custom_config(base.config)).to(dtype=dtype)
-    incompatible = model.load_state_dict(base.state_dict(), strict=False)
+    # The source checkpoint and converted backbone are both BF16. Assigning the
+    # existing tensor storage avoids a second full 14B CPU copy during bootstrap.
+    incompatible = model.load_state_dict(base.state_dict(), strict=False, assign=True)
     del base
 
     allowed_missing_fragments = (
@@ -157,22 +159,22 @@ def prepare(config_path: str | Path, *, force: bool = False) -> dict[str, Any]:
         resolved_snapshot,
         dtype=dtype,
     )
-    if int(model.config.num_hidden_layers) != 28 or int(model.config.hidden_size) != 1024:
+    if int(model.config.num_hidden_layers) != 40 or int(model.config.hidden_size) != 5120:
         raise ValueError(
-            "Qwen/Qwen3-0.6B is expected to have 28 layers and hidden size 1024; "
+            "Qwen/Qwen3-14B is expected to have 40 layers and hidden size 5120; "
             f"got {model.config.num_hidden_layers} and {model.config.hidden_size}"
         )
     output_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(
         output_dir,
         safe_serialization=True,
-        max_shard_size="5GB",
+        max_shard_size="50GB",
     )
     tokenizer.save_pretrained(output_dir)
     weights = sorted(output_dir.glob("model*.safetensors"))
     if len(weights) != 1:
         raise RuntimeError(
-            f"Expected one Qwen3-0.6B weight file after conversion, got {weights}"
+            f"Expected one Qwen3-14B weight file after conversion, got {weights}"
         )
     query_names, query_hash = pseudo_query_sha256(model)
     snapshot_commit = resolved_snapshot.resolve().name

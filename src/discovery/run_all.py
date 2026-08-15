@@ -10,23 +10,32 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from safetensors.torch import load_file, save_file
 from transformers import AutoTokenizer
 
 from src.common import load_yaml, sha256_file, tokenizer_sha256
 from src.data.format_tasks import (
+    SUPERVISED_TASKS,
     TASK_TO_SOURCE,
-    load_local_split,
+    encode_prompt_target,
+    load_dataset_pool,
     load_manifest,
 )
-from src.data.streams import ManifestTaskRows
 from src.discovery.collect_reference import collect_full_reference
 from src.discovery.collect_reference import FullReference
 from src.discovery.dynamic_programming import solve_partition, valid_interval_mask
 from src.discovery.local_cost import local_surrogate_interval_cost
 from src.discovery.refine import refine_partition
 from src.discovery.replay import replay_partition
-from src.modeling.full_attnres import MoiraiQwen3ForCausalLM
+from src.distributed.fsdp_utils import (
+    barrier,
+    broadcast_object,
+    destroy_distributed,
+    init_distributed,
+    wrap_qwen3_fsdp,
+)
+from src.modeling.full_attnres import MoiraiQwen3DecoderLayer, MoiraiQwen3ForCausalLM
 from src.modeling.partition import MoiraiPartition
 from src.training.checkpointing import (
     pseudo_query_sha256,
@@ -34,7 +43,7 @@ from src.training.checkpointing import (
 )
 
 
-EXPECTED_TASKS = ["math", "multihop"]
+EXPECTED_TASKS = list(SUPERVISED_TASKS)
 
 
 def _weight_file(checkpoint: Path) -> Path:
@@ -64,14 +73,14 @@ def validate_discovery_config(config: dict[str, Any]) -> None:
     ):
         raise ValueError(
             "Stage 2 discovery_cases_per_task must give a positive count "
-            "for math and multihop"
+            f"for {', '.join(EXPECTED_TASKS)}"
         )
     expected = {
         "seed": 42,
-        "num_transformer_blocks": 28,
+        "num_transformer_blocks": 40,
         "observation_site_count": 2 * transformer_blocks + 1,
         "candidate_block_lengths": [1, 2, 3, 4],
-        "num_moirai_blocks": list(range(9, 17)),
+        "num_moirai_blocks": list(range(10, 17)),
         "no_adjacent_singletons": True,
         "near_optimal_ratio": 0.02,
         "boundary_refinement_sweeps": 5,
@@ -127,15 +136,20 @@ def _task_examples(
                 f"{task}/{source_name} requires exactly {source_expected} "
                 f"discovery cases, found {len(selected)}"
             )
-        dataset = load_local_split(source["local_path"], str(source["official_split"]))
-        rows = ManifestTaskRows(
-            task=task,
-            records=tuple(selected),
-            dataset=dataset,
-            field_mapping=source["field_mapping"],
-        )
+        pool = load_dataset_pool(data_config, str(source["dataset_name"]))
         all_records.extend(selected)
-        all_examples.extend(rows.target_examples(tokenizer, max_length=2048))
+        for record in selected:
+            dataset, field_mapping = pool[str(record["official_split"])]
+            all_examples.append(
+                encode_prompt_target(
+                    tokenizer,
+                    task=task,
+                    row=dataset[int(record["row_index"])],
+                    field_mapping=field_mapping,
+                    stable_id=str(record["stable_id"]),
+                    max_length=2048,
+                )
+            )
     if len(all_records) != expected_count:
         raise RuntimeError(
             f"{task} requires exactly {expected_count} discovery cases, "
@@ -222,10 +236,13 @@ def _score_partition(
 
 
 def _write_json(path: Path, payload: Any) -> None:
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    if dist.is_initialized():
+        dist.barrier()
 
 
 def _load_saved_activation_state(
@@ -319,7 +336,13 @@ def _load_saved_activation_state(
             gpu_observations = tuple(value.to(device) for value in cpu_observations)
             gpu_attention = tuple(tensors[key].to(device) for key in attention_keys)
             gpu_mlp = tuple(tensors[key].to(device) for key in mlp_keys)
-            embedding = model.model.embed_tokens(input_ids)
+            with torch.no_grad():
+                embedding = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    embedding_only=True,
+                ).input_embeddings
             residual_sources = [embedding]
             for attention_output, mlp_output in zip(gpu_attention, gpu_mlp):
                 residual_sources.extend((attention_output, mlp_output))
@@ -363,7 +386,10 @@ def _load_saved_activation_state(
                     f"expected {len(examples)}"
                 )
             cost_mean[interval] = np.mean(values, dtype=np.float64)
-        np.save(cost_path, cost_mean)
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            np.save(cost_path, cost_mean)
+        if dist.is_initialized():
+            dist.barrier()
     else:
         cost_mean = np.load(cost_path)
     if cost_mean.shape != expected_shape:
@@ -399,11 +425,12 @@ def _finish_task_discovery(
     reference_bytes = sum(
         _reference_storage_bytes(reference) for reference in replay_references
     )
-    print(
-        "Replay reference cache: "
-        f"task={task} device_cached={references_cached} "
-        f"bytes={reference_bytes}"
-    )
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        print(
+            "Replay reference cache: "
+            f"task={task} device_cached={references_cached} "
+            f"bytes={reference_bytes}"
+        )
     stable_ids_hash = hashlib.sha256(
         "\n".join(
             sorted(str(record["stable_id"]) for record in case_records)
@@ -548,12 +575,18 @@ def run_task_discovery(
     resume_activations: bool = False,
     recompute_activation_costs: bool = False,
 ) -> dict[str, Any]:
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    if dist.is_initialized():
+        dist.barrier()
     costs_by_interval: dict[tuple[int, int], list[float]] = {}
     replay_references: list[FullReference] = []
     activation_records: list[dict[str, Any]] = []
     activation_dir = output_dir / "activations"
-    activation_dir.mkdir(parents=True, exist_ok=True)
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        activation_dir.mkdir(parents=True, exist_ok=True)
+    if dist.is_initialized():
+        dist.barrier()
     mask = valid_interval_mask(num_transformer_blocks)
     source_counts = dict(sorted(Counter(
         str(record["dataset"]) for record in case_records
@@ -642,7 +675,10 @@ def run_task_discovery(
             },
             "attention_mask": reference.attention_mask.detach().cpu().contiguous(),
         }
-        save_file(activation_payload, activation_path)
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            save_file(activation_payload, activation_path)
+        if dist.is_initialized():
+            dist.barrier()
         activation_records.append(
             {
                 "case_index": case_index,
@@ -675,7 +711,10 @@ def run_task_discovery(
     if not np.isfinite(cost_mean[mask]).all():
         raise FloatingPointError("Stage 2 cost matrix contains non-finite valid entries")
 
-    np.save(output_dir / "cost_mean.npy", cost_mean)
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        np.save(output_dir / "cost_mean.npy", cost_mean)
+    if dist.is_initialized():
+        dist.barrier()
     _write_json(
         output_dir / "activation_manifest.json",
         {
@@ -750,7 +789,7 @@ def _validate_resume_outputs(
     if not isinstance(candidates, dict) or set(candidates) != {
         str(value) for value in candidate_block_counts
     }:
-        raise ValueError(f"Stage 2 resume candidates must cover N=9-16 for {task}")
+        raise ValueError(f"Stage 2 resume candidates differ from configuration for {task}")
     for value in candidate_block_counts:
         candidate = candidates[str(value)]
         if not isinstance(candidate, dict) or "partition" not in candidate:
@@ -781,9 +820,14 @@ def main() -> None:
         )
     config = load_yaml(args.config)
     validate_discovery_config(config)
+    context = init_distributed()
     candidate_block_counts = [int(value) for value in config["num_moirai_blocks"]]
     checkpoint = Path(args.checkpoint or config["base_checkpoint"])
-    checkpoint_manifest, checkpoint_hash = _checkpoint_manifest(checkpoint)
+    checkpoint_identity = broadcast_object(
+        _checkpoint_manifest(checkpoint) if context.is_rank0 else None,
+        context,
+    )
+    checkpoint_manifest, checkpoint_hash = checkpoint_identity
     if int(checkpoint_manifest.get("num_hidden_layers", 0)) != int(
         config["num_transformer_blocks"]
     ):
@@ -815,24 +859,31 @@ def main() -> None:
         resume_root = Path(args.resume)
         if resume_root.resolve() != Path(config["output_dir"]).resolve():
             raise ValueError("Stage 2 resume path must equal the configured output_dir")
-    if not torch.cuda.is_available():
-        raise RuntimeError("Formal Stage 2 discovery requires CUDA")
-    device = torch.device("cuda:0")
     model = MoiraiQwen3ForCausalLM.from_pretrained(
         checkpoint,
         local_files_only=True,
         torch_dtype=torch.bfloat16,
-    ).to(device)
+        low_cpu_mem_usage=True,
+    )
     model.eval()
     model.config.attnres_execution = "full"
     model.config.use_cache = False
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    query_names, actual_q_full_hash = pseudo_query_sha256(model)
+    query_identity = broadcast_object(
+        pseudo_query_sha256(model) if context.is_rank0 else None,
+        context,
+    )
+    query_names, actual_q_full_hash = query_identity
     if query_names != checkpoint_manifest.get("q_full_parameter_names"):
         raise ValueError("Stage 2 Q_full parameter names mismatch")
     if actual_q_full_hash != checkpoint_manifest.get("q_full_sha256"):
         raise ValueError("Stage 2 Q_full hash mismatch")
+    model = wrap_qwen3_fsdp(
+        model,
+        context,
+        decoder_layer_classes=(MoiraiQwen3DecoderLayer,),
+    )
 
     output_root = Path(args.output_dir or config["output_dir"])
     for task in tasks:
@@ -856,7 +907,7 @@ def main() -> None:
             examples=examples,
             case_records=case_records,
             output_dir=task_output,
-            device=device,
+            device=context.device,
             checkpoint_hash=checkpoint_hash,
             q_full_hash=checkpoint_manifest["q_full_sha256"],
             num_transformer_blocks=int(config["num_transformer_blocks"]),
@@ -867,6 +918,8 @@ def main() -> None:
                 args.recompute_costs_from_activations
             ),
         )
+    barrier(context)
+    destroy_distributed(context)
 
 
 if __name__ == "__main__":

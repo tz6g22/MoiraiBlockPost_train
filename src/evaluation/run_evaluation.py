@@ -3,25 +3,33 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import torch
-import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from src.common import load_yaml, sha256_file, tokenizer_sha256
 from src.data.format_tasks import (
+    SUPERVISED_TASKS,
     encode_prompt_only,
     encode_prompt_target,
     format_task_target,
-    load_local_split,
+    load_dataset_pool,
     load_manifest,
+    nested_value,
 )
 from src.discovery.collect_reference import collect_full_reference
 from src.discovery.replay import replay_partition
+from src.distributed.fsdp_utils import (
+    barrier,
+    broadcast_object,
+    destroy_distributed,
+    init_distributed,
+    load_selected_parameter_state,
+    wrap_qwen3_fsdp,
+)
 from src.evaluation.distortion import distortion_summary
 from src.evaluation.efficiency import (
     benchmark_cuda,
@@ -31,36 +39,19 @@ from src.evaluation.efficiency import (
 )
 from src.evaluation.task_metrics import mean_metrics, task_score
 from src.modeling.config_bundle import MoiraiConfigBundle
-from src.modeling.full_attnres import MoiraiQwen3ForCausalLM
+from src.modeling.full_attnres import MoiraiQwen3DecoderLayer, MoiraiQwen3ForCausalLM
 from src.modeling.partition import fixed_kimi_partition
-from src.probe.inference import MoiraiInferenceEngine
+from src.probe.inference import (
+    ALLOWED_PROBE_CLASSES,
+    ALLOWED_SELECTED_CONFIGS,
+    MoiraiInferenceEngine,
+)
 from src.training.checkpointing import validate_post_training_base_manifest
 
 
 METHODS = ("full_attnres", "kimi_fixed_raw", "kimi_fixed_adapted", "moiraiblock")
-TASKS = ("math", "multihop")
-GENERATION_LIMITS = {"math": 256, "multihop": 64}
-
-
-def _initialize_distributed() -> tuple[int, int, torch.device]:
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size == 1:
-        return 0, 1, torch.device("cuda:0")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    return rank, world_size, torch.device(f"cuda:{local_rank}")
-
-
-def _all_gather_objects(value: Any, world_size: int) -> list[Any]:
-    if world_size == 1:
-        return [value]
-    gathered: list[Any] = [None] * world_size
-    dist.all_gather_object(gathered, value)
-    return gathered
+TASKS = SUPERVISED_TASKS
+GENERATION_LIMITS = {"math": 256, "multihop": 64, "code": 512}
 
 
 def validate_evaluation_config(config: dict[str, Any]) -> None:
@@ -134,14 +125,11 @@ def _query_state(model) -> dict[str, torch.Tensor]:
 
 
 def _restore_query_state(model, state: dict[str, torch.Tensor]) -> None:
-    named = dict(model.named_parameters())
-    if set(state) != {
-        name for name in named if "pseudo_query" in name
-    }:
-        raise ValueError("Q_full state does not match the model query structure")
-    with torch.no_grad():
-        for name, value in state.items():
-            named[name].copy_(value.to(named[name].device, named[name].dtype))
+    load_selected_parameter_state(
+        model,
+        state,
+        lambda name, _parameter: "pseudo_query" in name,
+    )
 
 
 @torch.no_grad()
@@ -192,8 +180,7 @@ def _evaluation_rows(
             f"{task} final evaluation requires exactly {expected_count} cases, "
             f"found {len(selected)}"
         )
-    dataset = load_local_split(source["local_path"], str(source["official_split"]))
-    return selected, dataset, source["field_mapping"]
+    return selected, load_dataset_pool(data_config, str(source["dataset_name"]))
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -240,8 +227,14 @@ def main() -> None:
         if value:
             config[key] = value
     validate_evaluation_config(config)
+    context = init_distributed()
+    rank = context.rank
+    device = context.device
     checkpoint = Path(config["base_checkpoint"])
-    base_hash = _base_checkpoint_hash(checkpoint)
+    base_hash = broadcast_object(
+        _base_checkpoint_hash(checkpoint) if context.is_rank0 else None,
+        context,
+    )
     manifest_path = Path(config["data_manifest"])
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Evaluation manifest is missing: {manifest_path}")
@@ -272,9 +265,6 @@ def main() -> None:
         )
         for task in TASKS
     }
-    if not torch.cuda.is_available():
-        raise RuntimeError("Formal Stage 4 evaluation requires CUDA")
-    rank, world_size, device = _initialize_distributed()
     tokenizer = AutoTokenizer.from_pretrained(
         checkpoint,
         local_files_only=True,
@@ -289,11 +279,21 @@ def main() -> None:
         checkpoint,
         local_files_only=True,
         torch_dtype=torch.bfloat16,
-    ).to(device)
+        low_cpu_mem_usage=True,
+    )
     baseline_model.eval()
     for parameter in baseline_model.parameters():
         parameter.requires_grad_(False)
     q_full = _query_state(baseline_model)
+    baseline_parameter_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in baseline_model.parameters()
+    )
+    baseline_model = wrap_qwen3_fsdp(
+        baseline_model,
+        context,
+        decoder_layer_classes=(MoiraiQwen3DecoderLayer,),
+    )
     engine = MoiraiInferenceEngine.from_config(
         config["probe_config"],
         device=device,
@@ -312,11 +312,15 @@ def main() -> None:
     }
     probe_correct = 0
     probe_total = 0
+    selected_config_counts = {
+        selected: 0 for selected in sorted(ALLOWED_SELECTED_CONFIGS)
+    }
 
     try:
         for task in TASKS:
-            records, dataset, mapping = evaluation_data[task]
-            for record in records[rank::world_size]:
+            records, pool = evaluation_data[task]
+            for record in records:
+                dataset, mapping = pool[str(record["official_split"])]
                 row = dataset[int(record["row_index"])]
                 prompt = encode_prompt_only(
                     tokenizer,
@@ -384,11 +388,8 @@ def main() -> None:
                 )
                 probe_predicted_task = moirai.probe.predicted_task
                 selected_config = moirai.selected_config
-                allowed_probe_classes = {"math", "multihop"}
-                allowed_selected_configs = {"math", "multihop"}
-                assert probe_predicted_task in allowed_probe_classes
-                assert selected_config in allowed_selected_configs
-                assert selected_config == probe_predicted_task
+                assert probe_predicted_task in ALLOWED_PROBE_CLASSES
+                assert selected_config in ALLOWED_SELECTED_CONFIGS
                 method_predictions["moiraiblock"] = tokenizer.decode(
                     moirai.generated_ids[0].cpu(),
                     skip_special_tokens=True,
@@ -396,6 +397,7 @@ def main() -> None:
                 probe_total += 1
                 probe_correct += int(probe_predicted_task == task)
                 confusion[task][probe_predicted_task] += 1
+                selected_config_counts[selected_config] += 1
 
                 row_scores: dict[str, dict[str, float]] = {}
                 for method, prediction in method_predictions.items():
@@ -403,6 +405,26 @@ def main() -> None:
                         task,
                         prediction,
                         gold=gold,
+                        test_list=(
+                            list(
+                                nested_value(
+                                    row,
+                                    str(mapping["test_list"]),
+                                )
+                            )
+                            if task == "code"
+                            else None
+                        ),
+                        test_setup_code=(
+                            str(
+                                nested_value(
+                                    row,
+                                    str(mapping["test_setup_code"]),
+                                )
+                            )
+                            if task == "code"
+                            else ""
+                        ),
                     )
                     scores[method][task].append(metric)
                     row_scores[method] = metric
@@ -415,6 +437,7 @@ def main() -> None:
                         "selected_config": selected_config,
                         "probe_logits": list(moirai.probe.logits),
                         "probe_probabilities": list(moirai.probe.probabilities),
+                        "probe_confidence": moirai.probe.confidence,
                         "config_partition_sha256": moirai.partition_sha256,
                         "config_query_sha256": moirai.query_sha256,
                         "prediction": method_predictions["moiraiblock"],
@@ -428,53 +451,6 @@ def main() -> None:
                 )
     except Exception:
         raise
-
-    gathered_evaluation = _all_gather_objects(
-        {
-            "predictions": predictions,
-            "scores": scores,
-            "confusion": confusion,
-            "probe_correct": probe_correct,
-            "probe_total": probe_total,
-        },
-        world_size,
-    )
-    if rank == 0:
-        predictions = []
-        scores = {
-            method: {task: [] for task in TASKS}
-            for method in METHODS
-        }
-        confusion = {
-            task: {predicted: 0 for predicted in TASKS}
-            for task in TASKS
-        }
-        probe_correct = 0
-        probe_total = 0
-        for payload in gathered_evaluation:
-            predictions.extend(payload["predictions"])
-            probe_correct += int(payload["probe_correct"])
-            probe_total += int(payload["probe_total"])
-            for method in METHODS:
-                for task in TASKS:
-                    scores[method][task].extend(payload["scores"][method][task])
-            for task in TASKS:
-                for predicted in TASKS:
-                    confusion[task][predicted] += int(
-                        payload["confusion"][task][predicted]
-                    )
-        task_order = {task: index for index, task in enumerate(TASKS)}
-        record_order = {
-            (task, record["stable_id"]): index
-            for task in TASKS
-            for index, record in enumerate(evaluation_data[task][0])
-        }
-        predictions.sort(
-            key=lambda row: (
-                task_order[row["true_task"]],
-                record_order[(row["true_task"], row["stable_id"])],
-            )
-        )
 
     task_metrics = {
         method: {
@@ -502,6 +478,8 @@ def main() -> None:
         "correct": probe_correct,
         "total": probe_total,
         "confusion_by_true_task": confusion,
+        "selected_config_counts": selected_config_counts,
+        "fixed_selection_rate": selected_config_counts["fixed"] / probe_total,
     }
 
     distortion_values = {
@@ -509,9 +487,10 @@ def main() -> None:
         for method in METHODS
     }
     for task in TASKS:
-        records, dataset, mapping = evaluation_data[task]
+        records, pool = evaluation_data[task]
         diagnostic_records = records[: int(config["diagnostic_examples_per_task"])]
-        for record in diagnostic_records[rank::world_size]:
+        for record in diagnostic_records:
+            dataset, mapping = pool[str(record["official_split"])]
             row = dataset[int(record["row_index"])]
             example = encode_prompt_target(
                 tokenizer,
@@ -570,21 +549,6 @@ def main() -> None:
             )
             del reference, raw, adapted, moirai_distortion
             torch.cuda.empty_cache()
-    gathered_distortion = _all_gather_objects(distortion_values, world_size)
-    if rank == 0:
-        distortion_values = {
-            method: {task: [] for task in TASKS}
-            for method in METHODS
-        }
-        for payload in gathered_distortion:
-            for method in METHODS:
-                for task in TASKS:
-                    distortion_values[method][task].extend(payload[method][task])
-    else:
-        del engine, baseline_model
-        torch.cuda.empty_cache()
-        dist.destroy_process_group()
-        return
     distortion = {
         method: {
             task: distortion_summary(distortion_values[method][task])
@@ -595,8 +559,9 @@ def main() -> None:
 
     benchmark_tokens: list[int] = []
     for task in TASKS:
-        records, dataset, mapping = evaluation_data[task]
+        records, pool = evaluation_data[task]
         for record in records:
+            dataset, mapping = pool[str(record["official_split"])]
             prompt = encode_prompt_only(
                 tokenizer,
                 task=task,
@@ -616,14 +581,7 @@ def main() -> None:
     latency_rows: list[dict[str, Any]] = []
     memory_rows: list[dict[str, Any]] = []
     efficiency = config["efficiency"]
-    baseline_parameter_bytes = sum(
-        parameter.numel() * parameter.element_size()
-        for parameter in baseline_model.parameters()
-    )
-    engine_parameter_bytes = sum(
-        parameter.numel() * parameter.element_size()
-        for parameter in engine.model.parameters()
-    ) + sum(
+    engine_parameter_bytes = baseline_parameter_bytes + sum(
         parameter.numel() * parameter.element_size()
         for parameter in engine.probe_head.parameters()
     )
@@ -794,38 +752,40 @@ def main() -> None:
     }
 
     output_dir = Path(config["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as handle:
-        for prediction in predictions:
-            handle.write(json.dumps(prediction, ensure_ascii=False, sort_keys=True) + "\n")
-    _write_json(
-        output_dir / "evaluation_results.json",
-        {
-            "seed": int(config["seed"]),
-            "base_checkpoint_sha256": base_hash,
-            "primary_metric": config["primary_metric"],
-            "primary_scores": primary_scores,
-            "task_metrics": task_metrics,
-            "final_eval_probe_accuracy": final_eval_probe_accuracy,
-            "final_eval_probe": final_eval_probe_metrics,
-            "distortion": distortion,
-            "source_counts": source_counts,
-        },
-    )
+    if context.is_rank0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as handle:
+            for prediction in predictions:
+                handle.write(json.dumps(prediction, ensure_ascii=False, sort_keys=True) + "\n")
+        _write_json(
+            output_dir / "evaluation_results.json",
+            {
+                "seed": int(config["seed"]),
+                "base_checkpoint_sha256": base_hash,
+                "primary_metric": config["primary_metric"],
+                "primary_scores": primary_scores,
+                "task_metrics": task_metrics,
+                "final_eval_probe_accuracy": final_eval_probe_accuracy,
+                "final_eval_probe": final_eval_probe_metrics,
+                "distortion": distortion,
+                "source_counts": source_counts,
+            },
+        )
     efficiency_rows = [
         {"measurement": "latency", **row} for row in latency_rows
     ] + [{"measurement": "memory", **row} for row in memory_rows]
     fieldnames = sorted({key for row in efficiency_rows for key in row})
-    with (output_dir / "efficiency.csv").open(
-        "w", newline="", encoding="utf-8"
-    ) as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(efficiency_rows)
-    environment = runtime_environment(_commit_hash())
-    _write_json(output_dir / "environment.json", environment)
-    if world_size > 1:
-        dist.destroy_process_group()
+    if context.is_rank0:
+        with (output_dir / "efficiency.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(efficiency_rows)
+        environment = runtime_environment(_commit_hash())
+        _write_json(output_dir / "environment.json", environment)
+    barrier(context)
+    destroy_distributed(context)
 
 
 if __name__ == "__main__":

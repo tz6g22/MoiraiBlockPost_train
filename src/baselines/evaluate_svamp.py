@@ -10,7 +10,7 @@ from safetensors.torch import load_file
 import torch
 from transformers import AutoTokenizer
 
-from src.baselines.modeling import BaselineQwen3ForCausalLM
+from src.baselines.modeling import BaselineDecoderLayer, BaselineQwen3ForCausalLM
 from src.baselines.training import (
     _checkpoint_identity,
     _configure_execution,
@@ -27,6 +27,14 @@ from src.data.format_tasks import (
     load_manifest,
 )
 from src.data.prepare_post_data import _entry, _ordered_unique
+from src.distributed.fsdp_utils import (
+    DistributedContext,
+    barrier,
+    broadcast_object,
+    destroy_distributed,
+    init_distributed,
+    wrap_qwen3_fsdp,
+)
 
 
 EVALUATION_CASES = 10
@@ -98,7 +106,7 @@ def _load_trained_baseline(
     baseline_type: str,
     task: str,
     config: dict,
-    device: torch.device,
+    context: DistributedContext,
 ):
     if task not in {"math", "multihop"}:
         raise ValueError(f"Unsupported baseline evaluation task: {task}")
@@ -125,7 +133,10 @@ def _load_trained_baseline(
         raise ValueError(f"Baseline training manifest is not a valid {task} run")
 
     checkpoint = Path(config["base_checkpoint"])
-    base_hash, _ = _checkpoint_identity(checkpoint)
+    base_hash, _ = broadcast_object(
+        _checkpoint_identity(checkpoint) if context.is_rank0 else None,
+        context,
+    )
     if run_manifest.get("base_checkpoint_hash") != base_hash:
         raise ValueError("Baseline evaluation base checkpoint hash differs from training")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -137,7 +148,8 @@ def _load_trained_baseline(
         checkpoint,
         local_files_only=True,
         torch_dtype=torch.bfloat16,
-    ).to(device)
+        low_cpu_mem_usage=True,
+    )
     _configure_execution(model, baseline_type=baseline_type, config=config)
     if frozen_backbone_hash(model) != run_manifest.get("backbone_after_hash"):
         raise ValueError("Baseline backbone differs from the frozen training backbone")
@@ -160,6 +172,11 @@ def _load_trained_baseline(
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
+    model = wrap_qwen3_fsdp(
+        model,
+        context,
+        decoder_layer_classes=(BaselineDecoderLayer,),
+    )
     return model, tokenizer, run_manifest
 
 
@@ -194,8 +211,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline", required=True, choices=("full", "fixed"))
     args = parser.parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("Baseline SVAMP evaluation requires CUDA")
+    context = init_distributed()
 
     baseline_type = (
         "full_attnres" if args.baseline == "full" else "fixed_block_attnres"
@@ -203,12 +219,11 @@ def main() -> None:
     config_path = Path("configs/baselines") / f"{args.baseline}.yaml"
     config = load_yaml(config_path)
     validate_baseline_config(config, expected_type=baseline_type)
-    device = torch.device("cuda:0")
     model, tokenizer, training_manifest = _load_trained_baseline(
         baseline_type=baseline_type,
         task="math",
         config=config,
-        device=device,
+        context=context,
     )
 
     data_config = load_yaml("configs/data.yaml")
@@ -228,8 +243,8 @@ def main() -> None:
         )
         generated_ids = _greedy_generate(
             model,
-            prompt.input_ids.unsqueeze(0).to(device),
-            prompt.attention_mask.unsqueeze(0).to(device),
+            prompt.input_ids.unsqueeze(0).to(context.device),
+            prompt.attention_mask.unsqueeze(0).to(context.device),
             eos_token_id=tokenizer.eos_token_id,
         )
         prediction = tokenizer.decode(
@@ -249,17 +264,19 @@ def main() -> None:
             "accuracy": accuracy,
         }
         predictions.append(result)
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
+        if context.is_rank0:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
 
     output_dir = Path(config["output_root"]) / "evaluation_svamp_10"
-    output_dir.mkdir(parents=True, exist_ok=False)
-    (output_dir / "predictions.jsonl").write_text(
-        "".join(
-            json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
-            for row in predictions
-        ),
-        encoding="utf-8",
-    )
+    if context.is_rank0:
+        output_dir.mkdir(parents=True, exist_ok=False)
+        (output_dir / "predictions.jsonl").write_text(
+            "".join(
+                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                for row in predictions
+            ),
+            encoding="utf-8",
+        )
     result_payload = {
         "baseline_type": baseline_type,
         "task": "math",
@@ -276,11 +293,14 @@ def main() -> None:
         "training_query_after_hash": training_manifest["query_after_hash"],
         "training_case_selection_sha256": training_manifest["case_selection_sha256"],
     }
-    (output_dir / "evaluation_results.json").write_text(
-        json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    print(json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True))
+    if context.is_rank0:
+        (output_dir / "evaluation_results.json").write_text(
+            json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True))
+    barrier(context)
+    destroy_distributed(context)
 
 
 if __name__ == "__main__":

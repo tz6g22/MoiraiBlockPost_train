@@ -19,5 +19,8 @@ export PYTHONDONTWRITEBYTECODE=1
 
 "$PYTHON" -m src.modeling.prepare_hf_checkpoint \
   --config configs/model_source.yaml "$@"
+if [[ ! -f outputs/data/mbpp_full_preprocessed/preprocessing_manifest.json ]]; then
+  "$PYTHON" -m src.data.prepare_mbpp
+fi
 "$PYTHON" -m src.data.prepare_training_sources --config configs/data.yaml
 "$PYTHON" -m src.data.prepare_post_data --config configs/data.yaml

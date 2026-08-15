@@ -13,7 +13,7 @@ def validate_post_training_base_manifest(manifest: dict[str, Any]) -> None:
         "architecture": "Full AttnRes",
         "checkpoint_origin": "huggingface_post_training_bootstrap",
         "stage1_skipped": True,
-        "source_repo_id": "Qwen/Qwen3-0.6B",
+        "source_repo_id": "Qwen/Qwen3-14B",
         "conversion": "copy_qwen3_backbone_and_zero_initialize_attnres_parameters",
     }
     for key, expected in required.items():

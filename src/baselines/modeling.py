@@ -6,6 +6,7 @@ from typing import Any, Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
 from transformers.masking_utils import (
@@ -161,6 +162,7 @@ class BaselineQwen3Model(Qwen3PreTrainedModel):
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
         self.post_init()
 
@@ -170,8 +172,9 @@ class BaselineQwen3Model(Qwen3PreTrainedModel):
                 raise ValueError("Full AttnRes baseline must not define a partition")
             return frozenset()
         lengths = self.config.baseline_partition
-        if lengths != [4, 4, 4, 4, 4, 4, 4]:
-            raise ValueError("Fixed baseline partition must be [4,4,4,4,4,4,4]")
+        expected = [4] * (self.config.num_hidden_layers // 4)
+        if self.config.num_hidden_layers % 4 != 0 or lengths != expected:
+            raise ValueError("Fixed baseline partition must use four-layer blocks")
         if sum(lengths) != self.config.num_hidden_layers:
             raise ValueError("Fixed baseline partition does not cover the backbone")
         ends: list[int] = []
@@ -232,7 +235,7 @@ class BaselineQwen3Model(Qwen3PreTrainedModel):
         completed_sources: tuple[torch.Tensor, ...] = (inputs_embeds,)
         partial_block: torch.Tensor | None = None
         for layer_idx, layer in enumerate(self.layers):
-            next_partial, attention_output, mlp_output = layer(
+            layer_args = (
                 completed_sources,
                 partial_block,
                 causal_masks[layer.attention_type],
@@ -241,6 +244,14 @@ class BaselineQwen3Model(Qwen3PreTrainedModel):
                 cache_position,
                 position_embeddings,
             )
+            if self.gradient_checkpointing and self.training:
+                next_partial, attention_output, mlp_output = checkpoint(
+                    layer,
+                    *layer_args,
+                    use_reentrant=False,
+                )
+            else:
+                next_partial, attention_output, mlp_output = layer(*layer_args)
             if self.config.baseline_execution == "full":
                 completed_sources += (attention_output, mlp_output)
                 partial_block = None

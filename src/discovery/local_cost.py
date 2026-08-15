@@ -3,8 +3,6 @@ from __future__ import annotations
 import torch
 
 from src.discovery.collect_reference import FullReference
-from src.modeling.block_attnres import sum_block_sources
-from src.modeling.full_attnres import attnres_aggregate
 
 
 def masked_normalized_frobenius(
@@ -68,60 +66,21 @@ def local_surrogate_interval_cost(
     if model.config.attnres_execution != "full":
         raise ValueError("Local surrogate requires the frozen Full model")
 
-    sources = reference.residual_sources
-    interval_start = 1 + 2 * start
-    interval_stop = 1 + 2 * (end + 1)
-    block_summary = sum_block_sources(sources[interval_start:interval_stop])
-
-    def compressed_sources(available_count: int) -> tuple[torch.Tensor, ...]:
-        if available_count < interval_stop:
-            raise ValueError("Local comparison site is not downstream of interval")
-        return (
-            sources[:interval_start]
-            + (block_summary,)
-            + sources[interval_stop:available_count]
-        )
-
-    errors: list[torch.Tensor] = []
-    for layer_index in range(end + 1, transformer_blocks):
-        layer = model.model.layers[layer_index]
-        completed = compressed_sources(1 + 2 * layer_index)
-        z_attn = attnres_aggregate(
-            completed,
-            layer.attn_pseudo_query,
-            layer.attn_key_norm,
-        )
-        errors.append(
-            masked_normalized_frobenius(
-                reference.observations[2 * layer_index],
-                z_attn,
-                reference.attention_mask,
-            )
-        )
-        z_mlp = attnres_aggregate(
-            completed + (reference.attention_outputs[layer_index],),
-            layer.mlp_pseudo_query,
-            layer.mlp_key_norm,
-        )
-        errors.append(
-            masked_normalized_frobenius(
-                reference.observations[2 * layer_index + 1],
-                z_mlp,
-                reference.attention_mask,
-            )
-        )
-
-    z_final = attnres_aggregate(
-        compressed_sources(len(sources)),
-        model.model.final_pseudo_query,
-        model.model.final_key_norm,
+    result = model(
+        local_surrogate_request={
+            "residual_sources": reference.residual_sources,
+            "attention_outputs": reference.attention_outputs,
+            "start": start,
+            "end": end,
+        },
+        use_cache=False,
     )
-    errors.append(
-        masked_normalized_frobenius(
-            reference.observations[-1],
-            z_final,
-            reference.attention_mask,
-        )
-    )
+    full_sites = reference.observations[2 * (end + 1) :]
+    compared_sites = tuple(result.local_surrogate_sites)
+    if len(full_sites) != len(compared_sites):
+        raise RuntimeError("Local surrogate observation count changed")
+    errors = [
+        masked_normalized_frobenius(full, compared, reference.attention_mask)
+        for full, compared in zip(full_sites, compared_sites)
+    ]
     return torch.stack(errors).mean(), len(errors)
-

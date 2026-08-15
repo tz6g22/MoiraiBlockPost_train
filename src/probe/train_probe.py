@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 
@@ -61,15 +62,26 @@ def main() -> None:
     validation = load_file(val_path)
     random.seed(int(config["seed"]))
     torch.manual_seed(int(config["seed"]))
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
     train_features = train["features"].to(device)
     train_labels = train["labels"].long().to(device)
     val_features = validation["features"].to(device)
     val_labels = validation["labels"].long().to(device)
     hidden_size = int(train_features.shape[1])
-    if hidden_size != 1024 or int(val_features.shape[1]) != hidden_size:
-        raise ValueError("Qwen3-0.6B probe features must have hidden size 1024")
-    head = torch.nn.Linear(hidden_size, 2).to(device)
+    if hidden_size != 5120 or int(val_features.shape[1]) != hidden_size:
+        raise ValueError("Qwen3-14B probe features must have hidden size 5120")
+    class_count = len(CLASS_TO_TASK)
+    expected_labels = set(range(class_count))
+    if set(train_labels.cpu().tolist()) != expected_labels:
+        raise ValueError("Probe training features do not cover every configured class")
+    if set(val_labels.cpu().tolist()) != expected_labels:
+        raise ValueError("Probe validation features do not cover every configured class")
+    head = torch.nn.Linear(hidden_size, class_count).to(device)
     initial_head = {
         name: parameter.detach().clone()
         for name, parameter in head.named_parameters()
@@ -138,6 +150,7 @@ def main() -> None:
                 "run_config_sha256": run_config_hash,
                 "probe_head_sha256": sha256_file(head_path),
                 "class_mapping": {str(index): task for index, task in CLASS_TO_TASK.items()},
+                "confidence_threshold": float(config["confidence_threshold"]),
                 "feature_config_sha256": feature_manifest["run_config_sha256"],
                 "train_feature_sha256": feature_manifest["train_feature_sha256"],
                 "validation_feature_sha256": feature_manifest["validation_feature_sha256"],

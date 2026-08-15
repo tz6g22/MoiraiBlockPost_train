@@ -1,8 +1,8 @@
 seed: 42
 precision: bf16
-distributed: torchrun_deepspeed_zero2
+distributed: torchrun_fsdp_full_shard
 use_cache: false
-base_checkpoint: outputs/base/qwen3_0_6b_full_attnres
+base_checkpoint: outputs/base/qwen3_14b_full_attnres
 data_manifest: outputs/data/splits.json
 data_config: configs/data.yaml
 partition_root: outputs/formal/discovery
@@ -23,4 +23,7 @@ training_token_unit: nonpadding_input
 training_passes: 1
 checkpoint_interval_steps: 100
 progress_interval_steps: 100
-training_cases_per_task: 200
+training_cases_per_task:
+  math: 1000
+  multihop: 1000
+  code: 200

@@ -2,37 +2,41 @@ from __future__ import annotations
 
 import argparse
 import gc
-import os
 import random
 from pathlib import Path
 from typing import Any
 
 import torch
-import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from src.adapter.train_query import (
     _checkpoint_weight,
     _load_task_examples,
-    _setup_distributed,
     train_query_partition,
     validate_query_training_protocol,
 )
 from src.common import config_sha256, load_yaml, tokenizer_sha256
 from src.data.format_tasks import load_manifest
+from src.distributed.fsdp_utils import (
+    barrier,
+    broadcast_object,
+    destroy_distributed,
+    init_distributed,
+)
 from src.modeling.partition import MoiraiPartition, fixed_kimi_partition
 
 
 FIXED_TASK = "fixed"
-FIXED_SOURCE_TASKS = ("math", "multihop")
+FIXED_SOURCE_TASKS = ("math", "multihop", "code")
+FIXED_TRAINING_CASES = {"math": 1000, "multihop": 1000, "code": 200}
 
 
 def validate_fixed_adapter_config(config: dict[str, Any]) -> None:
     validate_query_training_protocol(config, stage_name="Fixed query")
     expected = {
-        "num_transformer_blocks": 28,
+        "num_transformer_blocks": 40,
         "source_tasks": list(FIXED_SOURCE_TASKS),
-        "training_cases_per_task": 100,
+        "training_cases_per_task": FIXED_TRAINING_CASES,
     }
     for key, value in expected.items():
         if config.get(key) != value:
@@ -66,7 +70,7 @@ def _combined_examples(
     records: list[dict[str, Any]],
     data_config: dict[str, Any],
     tokenizer,
-    expected_count: int | None,
+    expected_counts: dict[str, int] | None,
 ):
     combined = []
     for source_task in FIXED_SOURCE_TASKS:
@@ -78,7 +82,8 @@ def _combined_examples(
             tokenizer=tokenizer,
             expected_count=None,
         )
-        if expected_count is not None:
+        if expected_counts is not None:
+            expected_count = int(expected_counts[source_task])
             if len(examples) < expected_count:
                 raise RuntimeError(
                     f"Fixed query {source_task}/{split_name} requires at least "
@@ -93,9 +98,14 @@ def main() -> None:
     args = parse_args()
     config = load_yaml(args.config)
     validate_fixed_adapter_config(config)
+    context = init_distributed()
     run_config_hash = config_sha256(args.config)
     checkpoint = Path(args.checkpoint or config["base_checkpoint"])
-    _, base_checkpoint_hash, checkpoint_manifest = _checkpoint_weight(checkpoint)
+    checkpoint_identity = broadcast_object(
+        _checkpoint_weight(checkpoint) if context.is_rank0 else None,
+        context,
+    )
+    _, base_checkpoint_hash, checkpoint_manifest = checkpoint_identity
     output_dir = Path(args.output_root or config["output_root"]) / FIXED_TASK
     data_manifest_path = Path(args.data_manifest or config["data_manifest"])
     if not data_manifest_path.is_file():
@@ -119,28 +129,24 @@ def main() -> None:
         records=records,
         data_config=data_config,
         tokenizer=tokenizer,
-        expected_count=int(config["training_cases_per_task"]),
+        expected_counts={
+            task: int(config["training_cases_per_task"][task])
+            for task in FIXED_SOURCE_TASKS
+        },
     )
     validation_examples = _combined_examples(
         split_name="stage3_adapter_val",
         records=records,
         data_config=data_config,
         tokenizer=tokenizer,
-        expected_count=None,
+        expected_counts=None,
     )
 
-    rank, world_size, _, device = _setup_distributed()
-    os.environ.setdefault("XDG_CACHE_HOME", "/tmp/moiraiblock-xdg-cache")
-    os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/moiraiblock-triton-cache")
-    os.environ.setdefault("DS_SKIP_CUDA_CHECK", "1")
-    try:
-        import deepspeed
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Formal fixed query training requires DeepSpeed; install requirements.txt"
-        ) from exc
+    rank = context.rank
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if context.is_rank0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    barrier(context)
     partition_path = output_dir / "partition.json"
     if partition_path.is_file():
         existing = MoiraiPartition.from_json(partition_path)
@@ -148,13 +154,13 @@ def main() -> None:
             raise ValueError("Existing fixed partition does not use four-layer blocks")
     elif rank == 0:
         partition.save_json(partition_path)
-    dist.barrier()
+    barrier(context)
     if MoiraiPartition.from_json(partition_path).sha256 != partition.sha256:
         raise ValueError("Fixed partition changed during distributed setup")
 
-    random.seed(int(config["seed"]) + rank)
-    torch.manual_seed(int(config["seed"]) + rank)
-    torch.cuda.manual_seed_all(int(config["seed"]) + rank)
+    random.seed(int(config["seed"]))
+    torch.manual_seed(int(config["seed"]))
+    torch.cuda.manual_seed_all(int(config["seed"]))
     state_path = output_dir / "last_state.pt"
     if args.resume == "auto":
         resume = state_path.is_file()
@@ -176,15 +182,13 @@ def main() -> None:
         train_examples=train_examples,
         validation_examples=validation_examples,
         tokenizer=tokenizer,
-        rank=rank,
-        world_size=world_size,
-        device=device,
+        context=context,
         resume=resume,
-        deepspeed_module=deepspeed,
     )
-    dist.barrier()
+    barrier(context)
     gc.collect()
     torch.cuda.empty_cache()
+    destroy_distributed(context)
 
 
 if __name__ == "__main__":

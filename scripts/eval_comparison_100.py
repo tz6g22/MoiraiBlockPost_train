@@ -23,7 +23,17 @@ from src.data.format_tasks import (
 )
 from src.data.prepare_post_data import _entry, _ordered_unique
 from src.evaluation.task_metrics import task_score
-from src.probe.inference import ALLOWED_PROBE_CLASSES, MoiraiInferenceEngine
+from src.distributed.fsdp_utils import (
+    barrier,
+    broadcast_object,
+    destroy_distributed,
+    init_distributed,
+)
+from src.probe.inference import (
+    ALLOWED_PROBE_CLASSES,
+    ALLOWED_SELECTED_CONFIGS,
+    MoiraiInferenceEngine,
+)
 
 
 METHODS = ("moiraiblock", "full_attnres", "fixed_block_attnres")
@@ -143,8 +153,7 @@ def main() -> None:
     parser.add_argument("--method", required=True, choices=METHODS)
     parser.add_argument("--task", required=True, choices=TASKS)
     args = parser.parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("Comparison evaluation requires CUDA")
+    context = init_distributed()
 
     data_config = load_yaml("configs/data.yaml")
     manifest = load_manifest(data_config["output_dir"] + "/splits.json")
@@ -153,8 +162,12 @@ def main() -> None:
         data_config=data_config,
         manifest=manifest,
     )
-    selection_hash = _write_evaluation_set(task=args.task, records=records)
-    device = torch.device("cuda:0")
+    selection_hash = broadcast_object(
+        _write_evaluation_set(task=args.task, records=records)
+        if context.is_rank0
+        else None,
+        context,
+    )
 
     engine = None
     model = None
@@ -163,7 +176,7 @@ def main() -> None:
     if args.method == "moiraiblock":
         engine = MoiraiInferenceEngine.from_config(
             "configs/probe.yaml",
-            device=device,
+            device=context.device,
         )
         tokenizer = engine.tokenizer
     else:
@@ -174,19 +187,26 @@ def main() -> None:
             baseline_type=baseline_type,
             task=args.task,
             config=baseline_config,
-            device=device,
+            context=context,
         )
 
     output_dir = OUTPUT_ROOT / args.method / args.task
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise FileExistsError(f"Refusing to overwrite comparison output: {output_dir}")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_error = None
+    if context.is_rank0:
+        if output_dir.exists() and any(output_dir.iterdir()):
+            output_error = f"Refusing to overwrite comparison output: {output_dir}"
+        else:
+            output_dir.mkdir(parents=True, exist_ok=True)
+    output_error = broadcast_object(output_error, context)
+    if output_error is not None:
+        raise FileExistsError(output_error)
     predictions_path = output_dir / "predictions.jsonl"
     metric_rows: list[dict[str, float]] = []
-    route_counts = {task: 0 for task in TASKS}
+    route_counts = {mode: 0 for mode in sorted(ALLOWED_SELECTED_CONFIGS)}
     route_correct = 0
 
-    with predictions_path.open("x", encoding="utf-8") as handle:
+    handle = predictions_path.open("x", encoding="utf-8") if context.is_rank0 else None
+    try:
         for index, record in enumerate(records, start=1):
             row = dataset[int(record["row_index"])]
             prompt = encode_prompt_only(
@@ -197,8 +217,8 @@ def main() -> None:
                 stable_id=record["stable_id"],
                 max_length=2048 - GENERATION_LIMITS[args.task],
             )
-            input_ids = prompt.input_ids.unsqueeze(0).to(device)
-            attention_mask = prompt.attention_mask.unsqueeze(0).to(device)
+            input_ids = prompt.input_ids.unsqueeze(0).to(context.device)
+            attention_mask = prompt.attention_mask.unsqueeze(0).to(context.device)
             probe_predicted_task = None
             selected_config = args.task
             if engine is not None:
@@ -212,8 +232,8 @@ def main() -> None:
                 selected_config = inference.selected_config
                 if probe_predicted_task not in ALLOWED_PROBE_CLASSES:
                     raise RuntimeError("Main method produced an illegal Probe class")
-                if selected_config != probe_predicted_task:
-                    raise RuntimeError("Main method route differs from Probe prediction")
+                if selected_config not in ALLOWED_SELECTED_CONFIGS:
+                    raise RuntimeError("Main method produced an illegal routed config")
                 route_counts[selected_config] += 1
                 route_correct += int(selected_config == args.task)
             else:
@@ -242,19 +262,26 @@ def main() -> None:
                 "true_task": args.task,
                 "probe_predicted_task": probe_predicted_task,
                 "selected_config": selected_config,
+                "probe_confidence": (
+                    inference.probe.confidence if engine is not None else None
+                ),
                 "gold": gold,
                 "prediction": prediction,
                 "metrics": metrics,
             }
-            handle.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
-            handle.flush()
-            if index % 10 == 0:
+            if handle is not None:
+                handle.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.flush()
+            if context.is_rank0 and index % 10 == 0:
                 current_correct = sum(int(row["accuracy"]) for row in metric_rows)
                 print(
                     f"{args.method} {args.task}: {index}/{EVALUATION_CASES}, "
                     f"correct={current_correct}",
                     flush=True,
                 )
+    finally:
+        if handle is not None:
+            handle.close()
 
     mean_metrics = {
         key: sum(float(row[key]) for row in metric_rows) / len(metric_rows)
@@ -282,11 +309,14 @@ def main() -> None:
             else None
         ),
     }
-    (output_dir / "evaluation_results.json").write_text(
-        json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    print(json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True))
+    if context.is_rank0:
+        (output_dir / "evaluation_results.json").write_text(
+            json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True))
+    barrier(context)
+    destroy_distributed(context)
 
 
 if __name__ == "__main__":

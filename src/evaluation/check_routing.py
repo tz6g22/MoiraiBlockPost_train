@@ -14,6 +14,7 @@ from src.evaluation.run_evaluation import (
     _evaluation_rows,
     validate_evaluation_config,
 )
+from src.distributed.fsdp_utils import barrier, destroy_distributed, init_distributed
 from src.probe.inference import (
     ALLOWED_PROBE_CLASSES,
     ALLOWED_SELECTED_CONFIGS,
@@ -31,8 +32,7 @@ def main() -> None:
     args = parse_args()
     config = load_yaml(args.config)
     validate_evaluation_config(config)
-    if not torch.cuda.is_available():
-        raise RuntimeError("Stage 4 routing check requires CUDA")
+    context = init_distributed()
 
     manifest = load_manifest(Path(config["data_manifest"]))
     data_config = load_yaml(config["data_config"])
@@ -47,13 +47,14 @@ def main() -> None:
     }
     engine = MoiraiInferenceEngine.from_config(
         config["probe_config"],
-        device=torch.device("cuda:0"),
+        device=context.device,
     )
     tokenizer = engine.tokenizer
 
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, object]] = []
     true_counts = {task: 0 for task in TASKS}
     predicted_counts = {task: 0 for task in TASKS}
+    selected_counts = {mode: 0 for mode in sorted(ALLOWED_SELECTED_CONFIGS)}
     confusion = {
         task: {predicted: 0 for predicted in TASKS}
         for task in TASKS
@@ -61,8 +62,9 @@ def main() -> None:
     correct = 0
 
     for true_task in TASKS:
-        records, dataset, mapping = evaluation_data[true_task]
+        records, pool = evaluation_data[true_task]
         for record in records:
+            dataset, mapping = pool[str(record["official_split"])]
             prompt = encode_prompt_only(
                 tokenizer,
                 task=true_task,
@@ -78,10 +80,10 @@ def main() -> None:
             probe_predicted_task = prediction.predicted_task
             assert probe_predicted_task in ALLOWED_PROBE_CLASSES
             assert selected_config in ALLOWED_SELECTED_CONFIGS
-            assert selected_config == probe_predicted_task
 
             true_counts[true_task] += 1
             predicted_counts[probe_predicted_task] += 1
+            selected_counts[selected_config] += 1
             confusion[true_task][probe_predicted_task] += 1
             correct += int(true_task == probe_predicted_task)
             rows.append(
@@ -90,6 +92,7 @@ def main() -> None:
                     "true_task": true_task,
                     "probe_predicted_task": probe_predicted_task,
                     "selected_config": selected_config,
+                    "probe_confidence": prediction.confidence,
                 }
             )
 
@@ -99,13 +102,17 @@ def main() -> None:
     result = {
         "true_counts": true_counts,
         "predicted_counts": predicted_counts,
+        "selected_counts": selected_counts,
         "confusion_matrix": confusion,
         "final_eval_probe_accuracy": correct / total,
         "correct": correct,
         "total": total,
         "rows": rows,
     }
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    if context.is_rank0:
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    barrier(context)
+    destroy_distributed(context)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from src.data.format_tasks import (
 )
 from src.data.prepare_post_data import _entry, _ordered_unique
 from src.evaluation.task_metrics import extract_math_answer
+from src.distributed.fsdp_utils import barrier, destroy_distributed, init_distributed
 from src.probe.inference import (
     ALLOWED_PROBE_CLASSES,
     ALLOWED_SELECTED_CONFIGS,
@@ -82,8 +83,7 @@ def _select_unused_svamp_cases(
 
 
 def main() -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError("SVAMP evaluation requires CUDA")
+    context = init_distributed()
     data_config = load_yaml("configs/data.yaml")
     manifest = load_manifest(data_config["output_dir"] + "/splits.json")
     records, dataset, mapping = _select_unused_svamp_cases(
@@ -92,11 +92,11 @@ def main() -> None:
     )
     engine = MoiraiInferenceEngine.from_config(
         "configs/probe.yaml",
-        device=torch.device("cuda:0"),
+        device=context.device,
     )
     predictions: list[dict] = []
     correct = 0
-    route_counts = {task: 0 for task in sorted(ALLOWED_PROBE_CLASSES)}
+    route_counts = {task: 0 for task in sorted(ALLOWED_SELECTED_CONFIGS)}
     for record in records:
         row = dataset[int(record["row_index"])]
         prompt = encode_prompt_only(
@@ -116,7 +116,6 @@ def main() -> None:
         selected_config = result.selected_config
         assert probe_predicted_task in ALLOWED_PROBE_CLASSES
         assert selected_config in ALLOWED_SELECTED_CONFIGS
-        assert selected_config == probe_predicted_task
         prediction = engine.tokenizer.decode(
             result.generated_ids[0].cpu(),
             skip_special_tokens=True,
@@ -133,6 +132,7 @@ def main() -> None:
                 "true_task": "math",
                 "probe_predicted_task": probe_predicted_task,
                 "selected_config": selected_config,
+                "probe_confidence": result.probe.confidence,
                 "question": row[mapping["question"]],
                 "gold": gold,
                 "prediction": prediction,
@@ -149,19 +149,22 @@ def main() -> None:
         "stable_ids": [record["stable_id"] for record in records],
         "selection": "seed42 ordered, excluding every existing manifest ID/content hash",
     }
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUTPUT_DIR / "predictions.jsonl").write_text(
-        "".join(
-            json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
-            for row in predictions
-        ),
-        encoding="utf-8",
-    )
-    (OUTPUT_DIR / "evaluation_results.json").write_text(
-        json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    print(json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True))
+    if context.is_rank0:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        (OUTPUT_DIR / "predictions.jsonl").write_text(
+            "".join(
+                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                for row in predictions
+            ),
+            encoding="utf-8",
+        )
+        (OUTPUT_DIR / "evaluation_results.json").write_text(
+            json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(result_payload, ensure_ascii=False, indent=2, sort_keys=True))
+    barrier(context)
+    destroy_distributed(context)
 
 
 if __name__ == "__main__":

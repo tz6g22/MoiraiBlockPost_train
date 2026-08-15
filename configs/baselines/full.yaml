@@ -5,7 +5,7 @@ fixed_partition: null
 seed: 42
 precision: bf16
 use_cache: false
-base_checkpoint: outputs/base/qwen3_0_6b_full_attnres
+base_checkpoint: outputs/base/qwen3_14b_full_attnres
 data_manifest: outputs/data/splits.json
 data_config: configs/data.yaml
 output_root: outputs/baselines/full
@@ -27,4 +27,4 @@ weight_decay: 0.0
 gradient_clip_norm: 1.0
 scheduler: constant
 
-expected_num_transformer_blocks: 28
+expected_num_transformer_blocks: 40

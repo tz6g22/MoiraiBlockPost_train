@@ -22,6 +22,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
 )
 
+from src.modeling.block_attnres import sum_block_sources
 from src.modeling.partition import MoiraiPartition
 
 
@@ -125,11 +126,12 @@ class MoiraiQwen3DecoderLayer(nn.Module):
         self,
         completed_sources: tuple[torch.Tensor, ...],
         partial_block: torch.Tensor | None,
-        attention_mask: torch.Tensor | None,
-        position_ids: torch.LongTensor,
-        past_key_values: Cache | None,
-        cache_position: torch.LongTensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        surrogate_attention_output: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -148,6 +150,17 @@ class MoiraiQwen3DecoderLayer(nn.Module):
             self.attn_pseudo_query,
             self.attn_key_norm,
         )
+        if surrogate_attention_output is not None:
+            if partial_block is not None:
+                raise ValueError("Local surrogate requires a completed source history")
+            z_mlp = attnres_aggregate(
+                completed_sources + (surrogate_attention_output,),
+                self.mlp_pseudo_query,
+                self.mlp_key_norm,
+            )
+            return z_attn, z_mlp
+        if position_ids is None or cache_position is None or position_embeddings is None:
+            raise ValueError("Normal decoder execution requires position information")
         attn_output, _ = self.self_attn(
             hidden_states=self.input_layernorm(z_attn),
             attention_mask=attention_mask,
@@ -277,14 +290,58 @@ class MoiraiQwen3Model(Qwen3PreTrainedModel):
         cache_position: torch.LongTensor | None = None,
         return_attnres_observations: bool = False,
         probe_layer0_only: bool = False,
+        embedding_only: bool = False,
+        local_surrogate_request: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> BaseModelOutputWithPast:
+        if local_surrogate_request is not None:
+            if self.config.attnres_execution != "full":
+                raise ValueError("Local surrogate requires Full AttnRes execution")
+            sources = tuple(local_surrogate_request["residual_sources"])
+            attention_outputs = tuple(local_surrogate_request["attention_outputs"])
+            start = int(local_surrogate_request["start"])
+            end = int(local_surrogate_request["end"])
+            interval_start = 1 + 2 * start
+            interval_stop = 1 + 2 * (end + 1)
+            block_summary = sum_block_sources(
+                sources[interval_start:interval_stop]
+            )
+
+            def compressed_sources(available_count: int) -> tuple[torch.Tensor, ...]:
+                return (
+                    sources[:interval_start]
+                    + (block_summary,)
+                    + sources[interval_stop:available_count]
+                )
+
+            compared_sites: list[torch.Tensor] = []
+            for layer_index in range(end + 1, self.config.num_hidden_layers):
+                z_attn, z_mlp = self.layers[layer_index](
+                    compressed_sources(1 + 2 * layer_index),
+                    None,
+                    surrogate_attention_output=attention_outputs[layer_index],
+                )
+                compared_sites.extend((z_attn, z_mlp))
+            z_final = attnres_aggregate(
+                compressed_sources(len(sources)),
+                self.final_pseudo_query,
+                self.final_key_norm,
+            )
+            compared_sites.append(z_final)
+            output = BaseModelOutputWithPast(last_hidden_state=z_final, past_key_values=None)
+            output.local_surrogate_sites = tuple(compared_sites)
+            return output
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
         if use_cache:
             raise ValueError("MoiraiBlock execution requires use_cache=False")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        if embedding_only:
+            return BaseModelOutputWithPast(
+                last_hidden_state=inputs_embeds,
+                past_key_values=None,
+            )
 
         if cache_position is None:
             past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -427,6 +484,8 @@ class MoiraiQwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         logits_to_keep: int | torch.Tensor = 0,
         return_attnres_observations: bool = False,
         probe_layer0_only: bool = False,
+        embedding_only: bool = False,
+        local_surrogate_request: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast:
         outputs = self.model(
@@ -439,9 +498,32 @@ class MoiraiQwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             cache_position=cache_position,
             return_attnres_observations=return_attnres_observations,
             probe_layer0_only=probe_layer0_only,
+            embedding_only=embedding_only,
+            local_surrogate_request=local_surrogate_request,
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
+        if embedding_only:
+            output = CausalLMOutputWithPast(
+                logits=hidden_states.new_empty((hidden_states.shape[0], 0, self.vocab_size)),
+                past_key_values=None,
+            )
+            output.input_embeddings = hidden_states
+            return output
+        if local_surrogate_request is not None:
+            output = CausalLMOutputWithPast(
+                logits=hidden_states.new_empty((hidden_states.shape[0], 0, self.vocab_size)),
+                past_key_values=None,
+            )
+            output.local_surrogate_sites = outputs.local_surrogate_sites
+            return output
+        if probe_layer0_only:
+            output = CausalLMOutputWithPast(
+                logits=hidden_states.new_empty((hidden_states.shape[0], 0, self.vocab_size)),
+                past_key_values=None,
+            )
+            output.probe_hidden_state = hidden_states
+            return output
         slice_index = (
             slice(-logits_to_keep, None)
             if isinstance(logits_to_keep, int) and logits_to_keep > 0
