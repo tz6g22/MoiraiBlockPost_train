@@ -1,0 +1,16 @@
+seed: 42
+base_checkpoint: outputs/base/qwen3_0_6b_full_attnres
+data_manifest: outputs/data/splits.json
+data_config: configs/data.yaml
+tasks: [math, multihop]
+discovery_cases_per_task:
+  math: 200
+  multihop: 200
+num_transformer_blocks: 28
+observation_site_count: 57
+candidate_block_lengths: [1, 2, 3, 4]
+num_moirai_blocks: [9, 10, 11, 12, 13, 14, 15, 16]
+no_adjacent_singletons: true
+near_optimal_ratio: 0.02
+boundary_refinement_sweeps: 5
+output_dir: outputs/formal/discovery

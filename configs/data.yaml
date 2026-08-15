@@ -1,0 +1,135 @@
+tokenizer:
+  name_or_path: outputs/base/qwen3_0_6b_full_attnres
+  local_files_only: true
+
+split_seed: 42
+split_key_prefix: "moiraiblock-post-seed42::"
+output_dir: outputs/data
+
+counts:
+  stage2_discovery:
+    math: 200
+    multihop: 200
+  stage3_adapter_train: 200
+  stage3_adapter_val: 500
+  probe_train: 200
+  probe_val: 500
+  stage4_final_eval: 10
+
+sources:
+  gsm8k:
+    dataset_name: gsm8k
+    repo_id: openai/gsm8k
+    subset: main
+    local_path: artifacts/data/gsm8k_train
+    revision: 740312add88f781978c0658806c59bc2815b9866
+    official_split: train
+    field_mapping:
+      id: question
+      question: question
+      target: answer
+
+  clutrr:
+    dataset_name: clutrr
+    repo_id: CLUTRR/v1
+    subset: rob_train_clean_23_test_all_23
+    local_path: artifacts/data/clutrr_v1_task_1_2
+    revision: a8158d1fac10864c3424d53662fe63bf7d82dd87
+    official_split: train
+    expected_rows: 4054
+    task_name: task_1.2
+    split_urls:
+      train: https://raw.githubusercontent.com/kliang5/CLUTRR_huggingface_dataset/main/rob_train_clean_23_test_all_23/train.csv
+      validation: https://raw.githubusercontent.com/kliang5/CLUTRR_huggingface_dataset/main/rob_train_clean_23_test_all_23/validation.csv
+      test: https://raw.githubusercontent.com/kliang5/CLUTRR_huggingface_dataset/main/rob_train_clean_23_test_all_23/test.csv
+    field_mapping:
+      id: id
+      story: story
+      query: query
+      target: target_text
+
+  svamp:
+    dataset_name: svamp
+    repo_id: arkilpatel/SVAMP
+    subset: official
+    source_url: https://raw.githubusercontent.com/arkilpatel/SVAMP/689d7ccac74b9983a2ac7cc3b264f441b99e7c53/SVAMP.json
+    local_path: artifacts/data/svamp
+    revision: 689d7ccac74b9983a2ac7cc3b264f441b99e7c53
+    official_split: all
+    expected_rows: 1000
+    field_mapping:
+      id: id
+      question: question
+      target: answer
+
+discovery_sources:
+  math:
+    gsm8k: 100
+    svamp: 100
+  multihop:
+    clutrr: 200
+
+validation_sources:
+  multihop:
+    dataset_name: clutrr
+    repo_id: CLUTRR/v1
+    subset: rob_train_clean_23_test_all_23
+    local_path: artifacts/data/clutrr_v1_task_1_2
+    revision: a8158d1fac10864c3424d53662fe63bf7d82dd87
+    official_split: validation
+    expected_rows: 1014
+    task_name: task_1.2
+    split_urls:
+      train: https://raw.githubusercontent.com/kliang5/CLUTRR_huggingface_dataset/main/rob_train_clean_23_test_all_23/train.csv
+      validation: https://raw.githubusercontent.com/kliang5/CLUTRR_huggingface_dataset/main/rob_train_clean_23_test_all_23/validation.csv
+      test: https://raw.githubusercontent.com/kliang5/CLUTRR_huggingface_dataset/main/rob_train_clean_23_test_all_23/test.csv
+    field_mapping:
+      id: id
+      story: story
+      query: query
+      target: target_text
+
+probe_sources:
+  gsm8k_main_train:
+    dataset_name: gsm8k
+    repo_id: openai/gsm8k
+    subset: main
+    local_path: artifacts/data/gsm8k_train
+    revision: 740312add88f781978c0658806c59bc2815b9866
+    official_split: train
+    field_mapping:
+      id: question
+      question: question
+      target: answer
+
+evaluation_sources:
+  math:
+    dataset_name: gsm8k
+    repo_id: openai/gsm8k
+    subset: main
+    local_path: artifacts/data/gsm8k_test
+    revision: 740312add88f781978c0658806c59bc2815b9866
+    official_split: test
+    field_mapping:
+      id: question
+      question: question
+      target: answer
+
+  multihop:
+    dataset_name: clutrr
+    repo_id: CLUTRR/v1
+    subset: rob_train_clean_23_test_all_23
+    local_path: artifacts/data/clutrr_v1_task_1_2
+    revision: a8158d1fac10864c3424d53662fe63bf7d82dd87
+    official_split: test
+    expected_rows: 38
+    task_name: task_1.2
+    split_urls:
+      train: https://raw.githubusercontent.com/kliang5/CLUTRR_huggingface_dataset/main/rob_train_clean_23_test_all_23/train.csv
+      validation: https://raw.githubusercontent.com/kliang5/CLUTRR_huggingface_dataset/main/rob_train_clean_23_test_all_23/validation.csv
+      test: https://raw.githubusercontent.com/kliang5/CLUTRR_huggingface_dataset/main/rob_train_clean_23_test_all_23/test.csv
+    field_mapping:
+      id: id
+      story: story
+      query: query
+      target: target_text

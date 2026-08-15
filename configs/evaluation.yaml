@@ -1,0 +1,18 @@
+seed: 42
+base_checkpoint: outputs/base/qwen3_0_6b_full_attnres
+data_manifest: outputs/data/splits.json
+data_config: configs/data.yaml
+partition_root: outputs/formal/discovery
+query_root: outputs/formal/adapter
+probe_config: configs/probe.yaml
+output_dir: outputs/formal/evaluation
+use_cache: false
+do_sample: false
+num_beams: 1
+diagnostic_examples_per_task: 10
+evaluation_examples_per_task: 10
+primary_metric: accuracy
+efficiency:
+  lengths: [128, 512, 2048]
+  warmup_runs: 10
+  timed_runs: 50
