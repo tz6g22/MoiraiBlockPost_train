@@ -4,6 +4,7 @@ import argparse
 import gc
 import hashlib
 import json
+import os
 from pathlib import Path
 from collections import Counter
 from typing import Any
@@ -11,7 +12,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.distributed as dist
-from safetensors.torch import load_file, save_file
 from transformers import AutoTokenizer
 
 from src.common import load_yaml, sha256_file, tokenizer_sha256
@@ -28,6 +28,7 @@ from src.discovery.dynamic_programming import solve_partition, valid_interval_ma
 from src.discovery.local_cost import local_surrogate_interval_cost
 from src.discovery.refine import refine_partition
 from src.discovery.replay import replay_partition
+from src.discovery.ordinary_residual import require_defined_residual_cost
 from src.distributed.fsdp_utils import (
     barrier,
     broadcast_object,
@@ -165,241 +166,269 @@ def _reference_batch(example, device: torch.device) -> tuple[torch.Tensor, torch
     return input_ids, attention_mask
 
 
-def _reference_storage_bytes(reference: FullReference) -> int:
-    tensors = (*reference.observations, reference.attention_mask)
-    return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
-
-
-def _cache_replay_references(
-    references: list[FullReference],
-    device: torch.device,
-) -> tuple[list[FullReference], bool]:
-    """Keep replay-only reference tensors on CUDA when they safely fit."""
-    if device.type != "cuda" or not references:
-        return references, False
-
-    required_bytes = sum(_reference_storage_bytes(value) for value in references)
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-    reserve_bytes = max(2 * 1024**3, total_bytes // 4)
-    if required_bytes > max(0, free_bytes - reserve_bytes):
-        return references, False
-
-    cached: list[FullReference] = []
-    try:
-        for reference in references:
-            cached.append(
-                FullReference(
-                    observations=tuple(
-                        value.to(device=device) for value in reference.observations
-                    ),
-                    residual_sources=(),
-                    attention_outputs=(),
-                    mlp_outputs=(),
-                    attention_mask=reference.attention_mask.to(device=device),
-                )
-            )
-    except torch.OutOfMemoryError:
-        del cached
-        gc.collect()
-        torch.cuda.empty_cache()
-        return references, False
-    return cached, True
-
-
 def _score_partition(
     model,
     partition: MoiraiPartition,
     examples,
-    references,
     device: torch.device,
 ) -> tuple[float, list[float]]:
     scores: list[float] = []
-    for example, cpu_reference in zip(examples, references):
+    for example in examples:
         input_ids, attention_mask = _reference_batch(example, device)
-        reference = FullReference(
-            observations=tuple(value.to(device) for value in cpu_reference.observations),
+        full_reference = collect_full_reference(
+            model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        replay_reference = FullReference(
+            observations=full_reference.observations,
             residual_sources=(),
             attention_outputs=(),
             mlp_outputs=(),
-            attention_mask=cpu_reference.attention_mask.to(device),
+            attention_mask=full_reference.attention_mask,
         )
+        del full_reference
         replay = replay_partition(
             model,
             partition,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            reference=reference,
+            reference=replay_reference,
         )
         scores.append(replay.mean_distortion)
-        del reference, replay, input_ids, attention_mask
+        del replay_reference, replay, input_ids, attention_mask
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
     return sum(scores) / len(scores), scores
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
 
 
 def _write_json(path: Path, payload: Any) -> None:
     if not dist.is_initialized() or dist.get_rank() == 0:
-        path.write_text(
+        _atomic_write_text(
+            path,
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
         )
     if dist.is_initialized():
         dist.barrier()
 
 
-def _load_saved_activation_state(
+def _write_numpy(path: Path, value: np.ndarray) -> None:
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        temporary = path.with_name(f".{path.name}.tmp")
+        with temporary.open("wb") as handle:
+            np.save(handle, value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def _valid_intervals(num_transformer_blocks: int) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        (start, end)
+        for start in range(num_transformer_blocks)
+        for end in range(start, min(num_transformer_blocks, start + 4))
+    )
+
+
+def _validate_cost_record(
+    record: dict[str, Any],
+    *,
+    expected_index: int,
+    expected_stable_id: str,
+    intervals: tuple[tuple[int, int], ...],
+) -> None:
+    if int(record.get("case_index", -1)) != expected_index:
+        raise ValueError(f"Cost record case index mismatch at {expected_index}")
+    if record.get("stable_id") != expected_stable_id:
+        raise ValueError(f"Cost record stable ID mismatch at {expected_index}")
+    costs = record.get("interval_costs")
+    if not isinstance(costs, list) or len(costs) != len(intervals):
+        raise ValueError(f"Cost record interval count mismatch at {expected_index}")
+    for saved, expected in zip(costs, intervals):
+        if (
+            not isinstance(saved, list)
+            or len(saved) != 3
+            or (int(saved[0]), int(saved[1])) != expected
+            or not np.isfinite(float(saved[2]))
+        ):
+            raise ValueError(
+                f"Invalid cost record interval at case {expected_index}: {saved!r}"
+            )
+
+
+def _read_cost_records(
+    path: Path,
+    *,
+    case_records,
+    intervals: tuple[tuple[int, int], ...],
+) -> tuple[list[dict[str, Any]], int]:
+    if not path.is_file():
+        return [], 0
+    raw = path.read_bytes()
+    records: list[dict[str, Any]] = []
+    valid_bytes = 0
+    lines = raw.splitlines(keepends=True)
+    for line_index, line in enumerate(lines):
+        if not line.endswith(b"\n"):
+            break
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            if line_index != len(lines) - 1:
+                raise
+            break
+        if not isinstance(record, dict) or len(records) >= len(case_records):
+            raise ValueError("Cost record file contains an invalid or extra record")
+        _validate_cost_record(
+            record,
+            expected_index=len(records),
+            expected_stable_id=str(case_records[len(records)]["stable_id"]),
+            intervals=intervals,
+        )
+        records.append(record)
+        valid_bytes += len(line)
+    return records, valid_bytes
+
+
+def _prepare_cost_resume(
     *,
     task: str,
-    case_records: list[dict[str, Any]],
-    examples,
+    case_records,
     output_dir: Path,
-    num_transformer_blocks: int,
     source_counts: dict[str, int],
-    model,
-    device: torch.device,
-    recompute_costs: bool = False,
-) -> tuple[np.ndarray, list[FullReference]]:
-    manifest_path = output_dir / "activation_manifest.json"
-    cost_path = output_dir / "cost_mean.npy"
-    if not manifest_path.is_file() or (
-        not recompute_costs and not cost_path.is_file()
-    ):
-        raise FileNotFoundError(
-            "Activation resume requires activation_manifest.json and, unless "
-            "costs are being recomputed, cost_mean.npy"
-        )
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("task") != task:
-        raise ValueError("Activation manifest task mismatch")
-    if int(manifest.get("case_count", -1)) != len(case_records):
-        raise ValueError("Activation manifest case count mismatch")
-    if manifest.get("source_counts") != source_counts:
-        raise ValueError("Activation manifest source counts mismatch")
-    saved_records = manifest.get("records")
-    if not isinstance(saved_records, list) or len(saved_records) != len(case_records):
-        raise ValueError("Activation manifest records are incomplete")
+    checkpoint_hash: str,
+    q_full_hash: str,
+    intervals: tuple[tuple[int, int], ...],
+    resume: bool,
+) -> tuple[Path, list[dict[str, Any]]]:
+    cases_path = output_dir / "cases_manifest.json"
+    costs_path = output_dir / "cost_records.jsonl"
+    cases_manifest = {
+        "task": task,
+        "case_count": len(case_records),
+        "source_counts": source_counts,
+        "base_checkpoint_sha256": checkpoint_hash,
+        "q_full_sha256": q_full_hash,
+        "records": [
+            {
+                "case_index": index,
+                "stable_id": str(record["stable_id"]),
+                "dataset": str(record["dataset"]),
+            }
+            for index, record in enumerate(case_records)
+        ],
+    }
+    if resume and cases_path.is_file():
+        saved_manifest = json.loads(cases_path.read_text(encoding="utf-8"))
+        if saved_manifest != cases_manifest:
+            raise ValueError("Discovery cost resume identity mismatch")
+    elif resume and costs_path.is_file() and costs_path.stat().st_size:
+        raise ValueError("Cost records exist without a matching cases manifest")
+    else:
+        _write_json(cases_path, cases_manifest)
 
-    references: list[FullReference] = []
-    costs_by_interval: dict[tuple[int, int], list[float]] = {}
-    expected_observations = 2 * num_transformer_blocks + 1
-    for case_index, (saved, current, example) in enumerate(
-        zip(saved_records, case_records, examples)
-    ):
-        if int(saved.get("case_index", -1)) != case_index:
-            raise ValueError(f"Activation case index mismatch at {case_index}")
-        if saved.get("stable_id") != str(current["stable_id"]):
-            raise ValueError(f"Activation stable ID mismatch at {case_index}")
-        activation_path = Path(saved["file"])
-        if not activation_path.is_file():
-            raise FileNotFoundError(f"Missing saved activation: {activation_path}")
-        if sha256_file(activation_path) != saved.get("sha256"):
-            raise ValueError(f"Saved activation hash mismatch: {activation_path}")
-        tensors = load_file(activation_path, device="cpu")
-        observation_keys = sorted(
-            key for key in tensors if key.startswith("observation_")
-        )
-        if len(observation_keys) != expected_observations:
-            raise ValueError(
-                f"Saved activation {case_index} has {len(observation_keys)} "
-                f"observations; expected {expected_observations}"
-            )
-        cpu_observations = tuple(tensors[key] for key in observation_keys)
-        cpu_reference = FullReference(
-            observations=cpu_observations,
-            residual_sources=(),
-            attention_outputs=(),
-            mlp_outputs=(),
-            attention_mask=tensors["attention_mask"],
-        )
-        references.append(cpu_reference)
-
-        if recompute_costs:
-            attention_keys = sorted(
-                key
-                for key in tensors
-                if key.startswith("attention_") and key != "attention_mask"
-            )
-            mlp_keys = sorted(key for key in tensors if key.startswith("mlp_"))
-            if len(attention_keys) != num_transformer_blocks:
-                raise ValueError(
-                    f"Saved activation {case_index} has {len(attention_keys)} "
-                    f"Attention outputs; expected {num_transformer_blocks}"
-                )
-            if len(mlp_keys) != num_transformer_blocks:
-                raise ValueError(
-                    f"Saved activation {case_index} has {len(mlp_keys)} MLP "
-                    f"outputs; expected {num_transformer_blocks}"
-                )
-            input_ids, attention_mask = _reference_batch(example, device)
-            if not torch.equal(tensors["attention_mask"], attention_mask.cpu()):
-                raise ValueError(
-                    f"Saved activation attention mask mismatch at {case_index}"
-                )
-            gpu_observations = tuple(value.to(device) for value in cpu_observations)
-            gpu_attention = tuple(tensors[key].to(device) for key in attention_keys)
-            gpu_mlp = tuple(tensors[key].to(device) for key in mlp_keys)
-            with torch.no_grad():
-                embedding = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=False,
-                    embedding_only=True,
-                ).input_embeddings
-            residual_sources = [embedding]
-            for attention_output, mlp_output in zip(gpu_attention, gpu_mlp):
-                residual_sources.extend((attention_output, mlp_output))
-            full_reference = FullReference(
-                observations=gpu_observations,
-                residual_sources=tuple(residual_sources),
-                attention_outputs=gpu_attention,
-                mlp_outputs=gpu_mlp,
-                attention_mask=attention_mask,
-            )
-            for start in range(num_transformer_blocks):
-                for end in range(
-                    start, min(num_transformer_blocks, start + 4)
-                ):
-                    cost, _ = local_surrogate_interval_cost(
-                        model,
-                        full_reference,
-                        start=start,
-                        end=end,
-                    )
-                    value = float(cost.cpu())
-                    if not np.isfinite(value):
-                        raise FloatingPointError(
-                            f"Non-finite restored local cost for {task} {start}:{end}"
-                        )
-                    costs_by_interval.setdefault((start, end), []).append(value)
-            del full_reference, residual_sources, embedding
-            del gpu_observations, gpu_attention, gpu_mlp
-            del input_ids, attention_mask
-            gc.collect()
-            torch.cuda.empty_cache()
-        del tensors
-
-    expected_shape = (num_transformer_blocks, num_transformer_blocks)
-    if recompute_costs:
-        cost_mean = np.full(expected_shape, np.inf, dtype=np.float64)
-        for interval, values in costs_by_interval.items():
-            if len(values) != len(examples):
-                raise RuntimeError(
-                    f"Restored interval {interval} has {len(values)} costs, "
-                    f"expected {len(examples)}"
-                )
-            cost_mean[interval] = np.mean(values, dtype=np.float64)
+    if not resume:
         if not dist.is_initialized() or dist.get_rank() == 0:
-            np.save(cost_path, cost_mean)
+            _atomic_write_text(costs_path, "")
         if dist.is_initialized():
             dist.barrier()
-    else:
-        cost_mean = np.load(cost_path)
-    if cost_mean.shape != expected_shape:
-        raise ValueError(
-            f"Saved cost matrix has shape {cost_mean.shape}, expected {expected_shape}"
+        return costs_path, []
+
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        _, valid_bytes = _read_cost_records(
+            costs_path,
+            case_records=case_records,
+            intervals=intervals,
         )
-    mask = valid_interval_mask(num_transformer_blocks)
-    if not np.isfinite(cost_mean[mask]).all():
-        raise FloatingPointError("Saved cost matrix has non-finite valid entries")
-    return cost_mean, references
+        if costs_path.is_file() and valid_bytes != costs_path.stat().st_size:
+            with costs_path.open("r+b") as handle:
+                handle.truncate(valid_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+    if dist.is_initialized():
+        dist.barrier()
+    completed, _ = _read_cost_records(
+        costs_path,
+        case_records=case_records,
+        intervals=intervals,
+    )
+    return costs_path, completed
+
+
+def _append_cost_record(path: Path, record: dict[str, Any]) -> None:
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def _compute_case_cost_record(
+    *,
+    task: str,
+    case_index: int,
+    case_record: dict[str, Any],
+    example,
+    model,
+    device: torch.device,
+    intervals: tuple[tuple[int, int], ...],
+) -> dict[str, Any]:
+    # The old implementation below used Full AttnRes observations.  Keep the
+    # legacy code available for historical artifact readers, but never allow it
+    # to execute as the formal Discovery objective.
+    raise RuntimeError(
+        "RESIDUAL_DISCOVERY_COST_UNDEFINED: legacy AttnRes local cost is not "
+        "a valid ordinary-residual Discovery cost"
+    )
+
+    # pragma: no cover - retained only as a historical reference path.
+    input_ids, attention_mask = _reference_batch(example, device)
+    reference = collect_full_reference(
+        model,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    )
+    interval_costs: list[list[int | float]] = []
+    try:
+        for start, end in intervals:
+            cost, _ = local_surrogate_interval_cost(
+                model,
+                reference,
+                start=start,
+                end=end,
+            )
+            value = float(cost.cpu())
+            del cost
+            if not np.isfinite(value):
+                raise FloatingPointError(
+                    f"Non-finite local cost for {task} {start}:{end}"
+                )
+            interval_costs.append([start, end, value])
+        return {
+            "case_index": case_index,
+            "stable_id": str(case_record["stable_id"]),
+            "sequence_length": int(reference.attention_mask.shape[-1]),
+            "interval_costs": interval_costs,
+        }
+    finally:
+        del reference, input_ids, attention_mask
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 def _finish_task_discovery(
@@ -413,24 +442,10 @@ def _finish_task_discovery(
     checkpoint_hash: str,
     q_full_hash: str,
     cost_mean: np.ndarray,
-    replay_references: list[FullReference],
     candidate_block_counts: list[int],
     maximum_refinement_sweeps: int,
     source_counts: dict[str, int],
 ) -> dict[str, Any]:
-    replay_references, references_cached = _cache_replay_references(
-        replay_references,
-        device,
-    )
-    reference_bytes = sum(
-        _reference_storage_bytes(reference) for reference in replay_references
-    )
-    if not dist.is_initialized() or dist.get_rank() == 0:
-        print(
-            "Replay reference cache: "
-            f"task={task} device_cached={references_cached} "
-            f"bytes={reference_bytes}"
-        )
     stable_ids_hash = hashlib.sha256(
         "\n".join(
             sorted(str(record["stable_id"]) for record in case_records)
@@ -484,7 +499,6 @@ def _finish_task_discovery(
                 model,
                 result.partition,
                 examples,
-                replay_references,
                 device,
             )
             cached_candidates[key] = {
@@ -513,9 +527,7 @@ def _finish_task_discovery(
     initial_partition = candidates[selected_n]
 
     def score(candidate: MoiraiPartition) -> float:
-        mean, _ = _score_partition(
-            model, candidate, examples, replay_references, device
-        )
+        mean, _ = _score_partition(model, candidate, examples, device)
         return mean
 
     refined = refine_partition(
@@ -556,6 +568,18 @@ def _finish_task_discovery(
     if any(parameter.grad is not None for parameter in model.parameters()):
         raise RuntimeError("Stage 2 unexpectedly produced parameter gradients")
     _write_json(output_dir / "discovery_result.json", result)
+    _write_json(
+        output_dir / "stage2_manifest.json",
+        {
+            "task": task,
+            "case_count": len(examples),
+            "base_checkpoint_sha256": checkpoint_hash,
+            "q_full_sha256": q_full_hash,
+            "cost_records_sha256": sha256_file(output_dir / "cost_records.jsonl"),
+            "cost_mean_sha256": sha256_file(output_dir / "cost_mean.npy"),
+            "partition_sha256": refined.partition.sha256,
+        },
+    )
     return result
 
 
@@ -572,135 +596,65 @@ def run_task_discovery(
     num_transformer_blocks: int,
     candidate_block_counts: list[int],
     maximum_refinement_sweeps: int,
-    resume_activations: bool = False,
-    recompute_activation_costs: bool = False,
+    resume: bool = False,
 ) -> dict[str, Any]:
     if not dist.is_initialized() or dist.get_rank() == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
     if dist.is_initialized():
         dist.barrier()
-    costs_by_interval: dict[tuple[int, int], list[float]] = {}
-    replay_references: list[FullReference] = []
-    activation_records: list[dict[str, Any]] = []
-    activation_dir = output_dir / "activations"
-    if not dist.is_initialized() or dist.get_rank() == 0:
-        activation_dir.mkdir(parents=True, exist_ok=True)
-    if dist.is_initialized():
-        dist.barrier()
     mask = valid_interval_mask(num_transformer_blocks)
+    intervals = _valid_intervals(num_transformer_blocks)
     source_counts = dict(sorted(Counter(
         str(record["dataset"]) for record in case_records
     ).items()))
+    costs_path, cost_records = _prepare_cost_resume(
+        task=task,
+        case_records=case_records,
+        output_dir=output_dir,
+        source_counts=source_counts,
+        checkpoint_hash=checkpoint_hash,
+        q_full_hash=q_full_hash,
+        intervals=intervals,
+        resume=resume,
+    )
+    costs_by_interval: dict[tuple[int, int], list[float]] = {
+        interval: [] for interval in intervals
+    }
+    for record in cost_records:
+        for start, end, value in record["interval_costs"]:
+            costs_by_interval[(int(start), int(end))].append(float(value))
 
-    if resume_activations:
-        cost_mean, replay_references = _load_saved_activation_state(
+    for case_index in range(len(cost_records), len(case_records)):
+        record = _compute_case_cost_record(
             task=task,
-            case_records=case_records,
-            examples=examples,
-            output_dir=output_dir,
-            num_transformer_blocks=num_transformer_blocks,
-            source_counts=source_counts,
+            case_index=case_index,
+            case_record=case_records[case_index],
+            example=examples[case_index],
             model=model,
             device=device,
-            recompute_costs=recompute_activation_costs,
+            intervals=intervals,
         )
-        return _finish_task_discovery(
-            task=task,
-            model=model,
-            examples=examples,
-            case_records=case_records,
-            output_dir=output_dir,
-            device=device,
-            checkpoint_hash=checkpoint_hash,
-            q_full_hash=q_full_hash,
-            cost_mean=cost_mean,
-            replay_references=replay_references,
-            candidate_block_counts=candidate_block_counts,
-            maximum_refinement_sweeps=maximum_refinement_sweeps,
-            source_counts=source_counts,
-        )
-
-    for case_index, (case_record, example) in enumerate(zip(case_records, examples)):
-        input_ids, attention_mask = _reference_batch(example, device)
-        reference = collect_full_reference(
-            model,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-        replay_references.append(
-            FullReference(
-                observations=tuple(
-                    value.detach().to(device="cpu", dtype=torch.bfloat16)
-                    for value in reference.observations
-                ),
-                residual_sources=(),
-                attention_outputs=(),
-                mlp_outputs=(),
-                attention_mask=reference.attention_mask.detach().cpu(),
-            )
-        )
-        for start in range(num_transformer_blocks):
-            for end in range(start, min(num_transformer_blocks, start + 4)):
-                cost, _ = local_surrogate_interval_cost(
-                    model,
-                    reference,
-                    start=start,
-                    end=end,
-                )
-                value = float(cost.cpu())
-                if not np.isfinite(value):
-                    raise FloatingPointError(
-                        f"Non-finite local cost for {task} {start}:{end}"
-                    )
-                costs_by_interval.setdefault((start, end), []).append(value)
-        activation_path = activation_dir / f"case_{case_index:02d}.safetensors"
-        activation_payload = {
-            **{
-                f"observation_{index:02d}": value.detach()
-                .to(device="cpu", dtype=torch.bfloat16)
-                .contiguous()
-                for index, value in enumerate(reference.observations)
-            },
-            **{
-                f"attention_{index:02d}": value.detach()
-                .to(device="cpu", dtype=torch.bfloat16)
-                .contiguous()
-                for index, value in enumerate(reference.attention_outputs)
-            },
-            **{
-                f"mlp_{index:02d}": value.detach()
-                .to(device="cpu", dtype=torch.bfloat16)
-                .contiguous()
-                for index, value in enumerate(reference.mlp_outputs)
-            },
-            "attention_mask": reference.attention_mask.detach().cpu().contiguous(),
-        }
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            save_file(activation_payload, activation_path)
         if dist.is_initialized():
-            dist.barrier()
-        activation_records.append(
-            {
-                "case_index": case_index,
-                "stable_id": str(case_record["stable_id"]),
-                "file": str(activation_path),
-                "sha256": sha256_file(activation_path),
-                "sequence_length": int(reference.attention_mask.shape[-1]),
-                "observation_site_count": len(reference.observations),
-                "attention_activation_count": len(reference.attention_outputs),
-                "mlp_activation_count": len(reference.mlp_outputs),
-            }
+            payload = [record if dist.get_rank() == 0 else None]
+            dist.broadcast_object_list(payload, src=0)
+            record = payload[0]
+        _validate_cost_record(
+            record,
+            expected_index=case_index,
+            expected_stable_id=str(case_records[case_index]["stable_id"]),
+            intervals=intervals,
         )
-        del activation_payload
-        del reference, input_ids, attention_mask
-        gc.collect()
-        torch.cuda.empty_cache()
+        _append_cost_record(costs_path, record)
+        cost_records.append(record)
+        for start, end, value in record["interval_costs"]:
+            costs_by_interval[(int(start), int(end))].append(float(value))
 
     cost_mean = np.full(
         (num_transformer_blocks, num_transformer_blocks),
         np.inf,
         dtype=np.float64,
     )
+    cost_std = np.full_like(cost_mean, np.inf)
     for interval, values in costs_by_interval.items():
         if len(values) != len(examples):
             raise RuntimeError(
@@ -708,21 +662,26 @@ def run_task_discovery(
                 f"expected {len(examples)}"
             )
         cost_mean[interval] = np.mean(values, dtype=np.float64)
+        cost_std[interval] = np.std(values, dtype=np.float64)
     if not np.isfinite(cost_mean[mask]).all():
         raise FloatingPointError("Stage 2 cost matrix contains non-finite valid entries")
+    if not np.isfinite(cost_std[mask]).all():
+        raise FloatingPointError("Stage 2 cost std matrix contains non-finite valid entries")
 
-    if not dist.is_initialized() or dist.get_rank() == 0:
-        np.save(output_dir / "cost_mean.npy", cost_mean)
-    if dist.is_initialized():
-        dist.barrier()
+    _write_numpy(output_dir / "cost_mean.npy", cost_mean)
+    _write_numpy(output_dir / "cost_std.npy", cost_std)
+    _write_numpy(output_dir / "valid_interval_mask.npy", mask)
     _write_json(
-        output_dir / "activation_manifest.json",
+        output_dir / "numerical_audit.json",
         {
             "task": task,
-            "case_count": len(activation_records),
-            "source_counts": source_counts,
-            "dtype": "bfloat16",
-            "records": activation_records,
+            "case_count": len(cost_records),
+            "valid_interval_count": int(mask.sum()),
+            "all_costs_finite": bool(np.isfinite(cost_mean[mask]).all()),
+            "cost_mean_min": float(cost_mean[mask].min()),
+            "cost_mean_max": float(cost_mean[mask].max()),
+            "cost_std_min": float(cost_std[mask].min()),
+            "cost_std_max": float(cost_std[mask].max()),
         },
     )
 
@@ -736,7 +695,6 @@ def run_task_discovery(
         checkpoint_hash=checkpoint_hash,
         q_full_hash=q_full_hash,
         cost_mean=cost_mean,
-        replay_references=replay_references,
         candidate_block_counts=candidate_block_counts,
         maximum_refinement_sweeps=maximum_refinement_sweeps,
         source_counts=source_counts,
@@ -751,12 +709,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-manifest", default="")
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--task", choices=EXPECTED_TASKS, default="")
-    parser.add_argument("--resume-activations", action="store_true")
-    parser.add_argument(
-        "--recompute-costs-from-activations",
-        action="store_true",
-        help="Rebuild cost_mean.npy from a validated saved activation manifest",
-    )
     return parser.parse_args()
 
 
@@ -814,11 +766,11 @@ def _validate_resume_outputs(
 
 def main() -> None:
     args = parse_args()
-    if args.recompute_costs_from_activations and not args.resume_activations:
-        raise ValueError(
-            "--recompute-costs-from-activations requires --resume-activations"
-        )
     config = load_yaml(args.config)
+    if config.get("model_mode") == "original_residual_only" or config.get(
+        "formal_discovery", False
+    ):
+        require_defined_residual_cost(config)
     validate_discovery_config(config)
     context = init_distributed()
     candidate_block_counts = [int(value) for value in config["num_moirai_blocks"]]
@@ -913,10 +865,7 @@ def main() -> None:
             num_transformer_blocks=int(config["num_transformer_blocks"]),
             candidate_block_counts=candidate_block_counts,
             maximum_refinement_sweeps=int(config["boundary_refinement_sweeps"]),
-            resume_activations=bool(args.resume_activations),
-            recompute_activation_costs=bool(
-                args.recompute_costs_from_activations
-            ),
+            resume=bool(args.resume),
         )
     barrier(context)
     destroy_distributed(context)

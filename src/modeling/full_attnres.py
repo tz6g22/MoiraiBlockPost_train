@@ -26,7 +26,7 @@ from src.modeling.block_attnres import sum_block_sources
 from src.modeling.partition import MoiraiPartition
 
 
-ExecutionMode = Literal["full", "moirai"]
+ExecutionMode = Literal["full", "moirai", "formal"]
 
 
 class MoiraiQwen3Config(Qwen3Config):
@@ -43,8 +43,8 @@ class MoiraiQwen3Config(Qwen3Config):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        if attnres_execution not in {"full", "moirai"}:
-            raise ValueError("attnres_execution must be 'full' or 'moirai'")
+        if attnres_execution not in {"full", "moirai", "formal"}:
+            raise ValueError("attnres_execution must be 'full', 'moirai', or 'formal'")
         self.attnres_execution = attnres_execution
         self.moirai_partition = moirai_partition
         self.moirai_task = moirai_task
@@ -121,6 +121,11 @@ class MoiraiQwen3DecoderLayer(nn.Module):
         self.attn_key_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp_pseudo_query = nn.Parameter(torch.zeros(config.hidden_size))
         self.mlp_key_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Formal task-specific gates are zero at conversion time.  They blend
+        # the Kimi-routed branch with the native residual stream without
+        # changing the Kimi cumulative block source semantics.
+        self.attn_alpha = nn.Parameter(torch.zeros(()))
+        self.mlp_alpha = nn.Parameter(torch.zeros(()))
 
     def forward(
         self,
@@ -132,6 +137,7 @@ class MoiraiQwen3DecoderLayer(nn.Module):
         cache_position: torch.LongTensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         surrogate_attention_output: torch.Tensor | None = None,
+        native_hidden: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -150,6 +156,8 @@ class MoiraiQwen3DecoderLayer(nn.Module):
             self.attn_pseudo_query,
             self.attn_key_norm,
         )
+        if native_hidden is not None:
+            z_attn = native_hidden + self.attn_alpha * (z_attn - native_hidden)
         if surrogate_attention_output is not None:
             if partial_block is not None:
                 raise ValueError("Local surrogate requires a completed source history")
@@ -181,9 +189,14 @@ class MoiraiQwen3DecoderLayer(nn.Module):
             self.mlp_pseudo_query,
             self.mlp_key_norm,
         )
+        native_after_attention = native_hidden + attn_output if native_hidden is not None else None
+        if native_after_attention is not None:
+            z_mlp = native_after_attention + self.mlp_alpha * (z_mlp - native_after_attention)
         mlp_output = self.mlp(self.post_attention_layernorm(z_mlp))
         next_partial = partial_after_attention + mlp_output
         layer_hidden = z_mlp + mlp_output
+        if native_after_attention is not None:
+            layer_hidden = native_after_attention + mlp_output
         return (
             next_partial,
             partial_after_attention,
@@ -196,7 +209,7 @@ class MoiraiQwen3DecoderLayer(nn.Module):
 
 
 class MoiraiQwen3Model(Qwen3PreTrainedModel):
-    """Full AttnRes reference and fixed-partition MoiraiBlock backbone."""
+    """Legacy Full AttnRes plus the post-Discovery formal Kimi runtime."""
 
     config_class = MoiraiQwen3Config
 
@@ -214,6 +227,7 @@ class MoiraiQwen3Model(Qwen3PreTrainedModel):
         )
         self.final_pseudo_query = nn.Parameter(torch.zeros(config.hidden_size))
         self.final_key_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.final_alpha = nn.Parameter(torch.zeros(()))
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
@@ -383,6 +397,72 @@ class MoiraiQwen3Model(Qwen3PreTrainedModel):
         residual_sources: list[torch.Tensor] = [inputs_embeds]
         attention_outputs: list[torch.Tensor] = []
         mlp_outputs: list[torch.Tensor] = []
+
+        if self.config.attnres_execution == "formal":
+            if partition is None:
+                raise ValueError("Formal Block AttnRes requires a frozen task partition")
+            native_hidden = inputs_embeds
+            for layer_idx, layer in enumerate(self.layers):
+                formal_args = (
+                    completed_sources,
+                    partial_block,
+                    causal_mask_mapping[layer.attention_type],
+                    position_ids,
+                    past_key_values,
+                    cache_position,
+                    position_embeddings,
+                    None,
+                    native_hidden,
+                )
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs = checkpoint(
+                        layer,
+                        *formal_args,
+                        use_reentrant=False,
+                    )
+                else:
+                    layer_outputs = layer(*formal_args)
+                (
+                    next_partial,
+                    partial_after_attention,
+                    attn_output,
+                    mlp_output,
+                    z_attn,
+                    z_mlp,
+                    layer_hidden,
+                ) = layer_outputs
+                native_hidden = layer_hidden
+                partial_block = next_partial
+                if layer_idx in boundary_ends:
+                    completed_sources = completed_sources + (partial_block,)
+                    partial_block = None
+                if return_attnres_observations:
+                    observations.extend((z_attn, z_mlp))
+                    attention_outputs.append(attn_output)
+                    mlp_outputs.append(mlp_output)
+            if partial_block is not None:
+                raise RuntimeError("Formal partition ended with an unfinished partial block")
+            routed_final = attnres_aggregate(
+                completed_sources,
+                self.final_pseudo_query,
+                self.final_key_norm,
+            )
+            z_final = native_hidden + self.final_alpha * (routed_final - native_hidden)
+            hidden_states = self.norm(z_final)
+            output = BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=None,
+            )
+            if return_attnres_observations:
+                output.attnres_observations = tuple(observations + [z_final])
+                output.attnres_sources = tuple((inputs_embeds, *completed_sources[1:]))
+                output.attnres_source_kinds = (
+                    "embedding",
+                    *("kimi_block_sum" for _ in completed_sources[1:]),
+                )
+                output.attnres_attention_outputs = tuple(attention_outputs)
+                output.attnres_mlp_outputs = tuple(mlp_outputs)
+            return output
 
         for layer_idx, layer in enumerate(self.layers):
             (

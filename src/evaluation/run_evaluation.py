@@ -40,16 +40,16 @@ from src.evaluation.efficiency import (
 from src.evaluation.task_metrics import mean_metrics, task_score
 from src.modeling.config_bundle import MoiraiConfigBundle
 from src.modeling.full_attnres import MoiraiQwen3DecoderLayer, MoiraiQwen3ForCausalLM
-from src.modeling.partition import fixed_kimi_partition
 from src.probe.inference import (
     ALLOWED_PROBE_CLASSES,
     ALLOWED_SELECTED_CONFIGS,
     MoiraiInferenceEngine,
+    select_probe_config,
 )
 from src.training.checkpointing import validate_post_training_base_manifest
 
 
-METHODS = ("full_attnres", "kimi_fixed_raw", "kimi_fixed_adapted", "moiraiblock")
+METHODS = ("full_attnres", "moiraiblock")
 TASKS = SUPERVISED_TASKS
 GENERATION_LIMITS = {"math": 256, "multihop": 64, "code": 512}
 
@@ -250,12 +250,36 @@ def main() -> None:
         )
         for task in TASKS
     }
-    fixed_root = Path(config["query_root"]) / "fixed"
-    fixed_bundle = _load_bundle(
-        partition_path=fixed_root / "partition.json",
-        query_manifest_path=fixed_root / "query_manifest.json",
-        base_hash=base_hash,
-    )
+    output_dir = Path(config["output_dir"])
+    bundle_paths = {
+        task: {
+            "partition_path": str(Path(config["partition_root"]) / task / "partition.json"),
+            "query_path": str(main_bundles[task].query_path),
+            "partition_sha256": main_bundles[task].partition.sha256,
+            "query_sha256": main_bundles[task].query_sha256,
+            "base_checkpoint": str(checkpoint),
+            "base_checkpoint_sha256": base_hash,
+        }
+        for task in TASKS
+    }
+    if context.is_rank0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            output_dir / "bundle_resolution.json",
+            {"query_root": str(Path(config["query_root"])), "bundles": bundle_paths},
+        )
+        for task in TASKS:
+            record = bundle_paths[task]
+            print(
+                "BUNDLE_RESOLUTION "
+                f"task={task} partition={record['partition_path']} "
+                f"partition_sha256={record['partition_sha256']} "
+                f"query={record['query_path']} "
+                f"query_sha256={record['query_sha256']} "
+                f"base_sha256={base_hash}",
+                flush=True,
+            )
+    barrier(context)
     evaluation_data = {
         task: _evaluation_rows(
             task,
@@ -293,12 +317,20 @@ def main() -> None:
         baseline_model,
         context,
         decoder_layer_classes=(MoiraiQwen3DecoderLayer,),
+        # Every rank validates the same single checkpoint hash above.  Loading
+        # identical CPU weights on each rank makes the initialization broadcast
+        # redundant and avoids its full-parameter GPU peak. FSDP shards on CPU;
+        # moving the wrapped model to the rank GPU moves only local shards.
+        sync_module_states=False,
+        device_id=None,
     )
+    baseline_model = baseline_model.to(device)
     engine = MoiraiInferenceEngine.from_config(
         config["probe_config"],
         device=device,
         model=baseline_model,
         tokenizer=tokenizer,
+        formal_bundles=main_bundles,
     )
 
     predictions: list[dict[str, Any]] = []
@@ -347,51 +379,25 @@ def main() -> None:
                     full_ids[0].cpu(),
                     skip_special_tokens=True,
                 )
-
-                _restore_query_state(baseline_model, q_full)
-                fixed = fixed_kimi_partition(
-                    task="fixed",
-                    num_transformer_blocks=baseline_model.config.num_hidden_layers,
+                # Probe only selects one of the three task bundles.  Its
+                # hidden state/cache is discarded before this fresh forward.
+                probe_prediction = engine.classify(input_ids, attention_mask)
+                selected_config = select_probe_config(
+                    probe_prediction,
+                    confidence_threshold=engine.confidence_threshold,
                 )
-                baseline_model.config.attnres_execution = "moirai"
-                baseline_model.config.moirai_partition = list(fixed.lengths)
-                baseline_model.config.moirai_task = "fixed"
-                fixed_raw_ids = _greedy_generate(
-                    baseline_model,
-                    input_ids,
-                    attention_mask,
-                    maximum_new_tokens=GENERATION_LIMITS[task],
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-                method_predictions["kimi_fixed_raw"] = tokenizer.decode(
-                    fixed_raw_ids[0].cpu(),
-                    skip_special_tokens=True,
-                )
-
-                fixed_bundle.apply_to_model(baseline_model)
-                fixed_adapted_ids = _greedy_generate(
-                    baseline_model,
-                    input_ids,
-                    attention_mask,
-                    maximum_new_tokens=GENERATION_LIMITS[task],
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-                method_predictions["kimi_fixed_adapted"] = tokenizer.decode(
-                    fixed_adapted_ids[0].cpu(),
-                    skip_special_tokens=True,
-                )
-
-                moirai = engine.infer(
+                formal_bundle = main_bundles[selected_config]
+                formal_bundle.apply_to_model(baseline_model)
+                formal_ids = engine._greedy_generate(
                     input_ids,
                     attention_mask,
                     maximum_new_tokens=GENERATION_LIMITS[task],
                 )
-                probe_predicted_task = moirai.probe.predicted_task
-                selected_config = moirai.selected_config
+                probe_predicted_task = probe_prediction.predicted_task
                 assert probe_predicted_task in ALLOWED_PROBE_CLASSES
                 assert selected_config in ALLOWED_SELECTED_CONFIGS
                 method_predictions["moiraiblock"] = tokenizer.decode(
-                    moirai.generated_ids[0].cpu(),
+                    formal_ids[0].cpu(),
                     skip_special_tokens=True,
                 )
                 probe_total += 1
@@ -435,11 +441,13 @@ def main() -> None:
                         "true_task": task,
                         "probe_predicted_task": probe_predicted_task,
                         "selected_config": selected_config,
-                        "probe_logits": list(moirai.probe.logits),
-                        "probe_probabilities": list(moirai.probe.probabilities),
-                        "probe_confidence": moirai.probe.confidence,
-                        "config_partition_sha256": moirai.partition_sha256,
-                        "config_query_sha256": moirai.query_sha256,
+                        "probe_logits": list(probe_prediction.logits),
+                        "probe_probabilities": list(probe_prediction.probabilities),
+                        "probe_confidence": probe_prediction.confidence,
+                        "config_partition_sha256": formal_bundle.partition.sha256,
+                        "config_query_sha256": formal_bundle.query_sha256,
+                        "config_partition_path": bundle_paths[selected_config]["partition_path"],
+                        "config_query_path": bundle_paths[selected_config]["query_path"],
                         "prediction": method_predictions["moiraiblock"],
                         "gold": gold,
                         "correct": bool(
@@ -479,7 +487,6 @@ def main() -> None:
         "total": probe_total,
         "confusion_by_true_task": confusion,
         "selected_config_counts": selected_config_counts,
-        "fixed_selection_rate": selected_config_counts["fixed"] / probe_total,
     }
 
     distortion_values = {
@@ -511,30 +518,6 @@ def main() -> None:
                 attention_mask=attention_mask,
             )
             distortion_values["full_attnres"][task].append(0.0)
-            fixed = fixed_kimi_partition(
-                task="fixed",
-                num_transformer_blocks=baseline_model.config.num_hidden_layers,
-            )
-            raw = replay_partition(
-                baseline_model,
-                fixed,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                reference=reference,
-            )
-            distortion_values["kimi_fixed_raw"][task].append(raw.mean_distortion)
-            fixed_bundle.apply_to_model(baseline_model)
-            baseline_model.config.attnres_execution = "full"
-            adapted = replay_partition(
-                baseline_model,
-                fixed,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                reference=reference,
-            )
-            distortion_values["kimi_fixed_adapted"][task].append(
-                adapted.mean_distortion
-            )
             main_bundles[task].apply_to_model(baseline_model)
             baseline_model.config.attnres_execution = "full"
             moirai_distortion = replay_partition(
@@ -547,7 +530,7 @@ def main() -> None:
             distortion_values["moiraiblock"][task].append(
                 moirai_distortion.mean_distortion
             )
-            del reference, raw, adapted, moirai_distortion
+            del reference, moirai_distortion
             torch.cuda.empty_cache()
     distortion = {
         method: {
@@ -602,27 +585,6 @@ def main() -> None:
                     attention_mask=mask,
                     use_cache=False,
                 )
-            elif method == "kimi_fixed_raw":
-                _restore_query_state(baseline_model, q_full)
-                fixed = fixed_kimi_partition(
-                    task="math",
-                    num_transformer_blocks=baseline_model.config.num_hidden_layers,
-                )
-                baseline_model.config.attnres_execution = "moirai"
-                baseline_model.config.moirai_partition = list(fixed.lengths)
-                baseline_model.config.moirai_task = "math"
-                operation = lambda: baseline_model(
-                    input_ids=ids,
-                    attention_mask=mask,
-                    use_cache=False,
-                )
-            elif method == "kimi_fixed_adapted":
-                fixed_bundle.apply_to_model(baseline_model)
-                operation = lambda: baseline_model(
-                    input_ids=ids,
-                    attention_mask=mask,
-                    use_cache=False,
-                )
             else:
                 probe_operation = lambda: engine.classify(ids, mask)
                 main_bundles["math"].apply_to_model(engine.model)
@@ -631,11 +593,20 @@ def main() -> None:
                     attention_mask=mask,
                     use_cache=False,
                 )
-                operation = lambda: engine.infer(
-                    ids,
-                    mask,
-                    maximum_new_tokens=1,
-                )
+                def canonical_probe_formal_operation():
+                    probe_prediction = engine.classify(ids, mask)
+                    selected_config = select_probe_config(
+                        probe_prediction,
+                        confidence_threshold=engine.confidence_threshold,
+                    )
+                    formal_bundle = main_bundles[selected_config]
+                    formal_bundle.apply_to_model(baseline_model)
+                    return engine._greedy_generate(
+                        ids,
+                        mask,
+                        maximum_new_tokens=1,
+                    )
+                operation = canonical_probe_formal_operation
                 probe_latency = benchmark_cuda(
                     probe_operation,
                     warmup_runs=int(efficiency["warmup_runs"]),
@@ -692,13 +663,6 @@ def main() -> None:
                     num_transformer_blocks=baseline_model.config.num_hidden_layers,
                     partition_lengths=None,
                 )
-            elif method in {"kimi_fixed_raw", "kimi_fixed_adapted"}:
-                counts = source_storage_counts(
-                    num_transformer_blocks=baseline_model.config.num_hidden_layers,
-                    partition_lengths=fixed_kimi_partition(
-                        num_transformer_blocks=baseline_model.config.num_hidden_layers
-                    ).lengths,
-                )
             else:
                 counts = source_storage_counts(
                     num_transformer_blocks=baseline_model.config.num_hidden_layers,
@@ -730,18 +694,6 @@ def main() -> None:
             num_transformer_blocks=baseline_model.config.num_hidden_layers,
             partition_lengths=None,
         ),
-        "kimi_fixed_raw": source_storage_counts(
-            num_transformer_blocks=baseline_model.config.num_hidden_layers,
-            partition_lengths=fixed_kimi_partition(
-                num_transformer_blocks=baseline_model.config.num_hidden_layers
-            ).lengths,
-        ),
-        "kimi_fixed_adapted": source_storage_counts(
-            num_transformer_blocks=baseline_model.config.num_hidden_layers,
-            partition_lengths=fixed_kimi_partition(
-                num_transformer_blocks=baseline_model.config.num_hidden_layers
-            ).lengths,
-        ),
         "moiraiblock": {
             task: source_storage_counts(
                 num_transformer_blocks=baseline_model.config.num_hidden_layers,
@@ -751,7 +703,6 @@ def main() -> None:
         },
     }
 
-    output_dir = Path(config["output_dir"])
     if context.is_rank0:
         output_dir.mkdir(parents=True, exist_ok=True)
         with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as handle:

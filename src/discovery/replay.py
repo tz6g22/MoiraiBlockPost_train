@@ -26,6 +26,8 @@ def replay_partition(
     reference: FullReference | None = None,
 ) -> ReplayResult:
     """True compressed forward; this is intentionally separate from local cost."""
+    if getattr(model.config, "attnres_execution", None) == "formal":
+        raise RuntimeError("Formal Discovery cannot run compressed Block AttnRes replay")
     if partition.num_transformer_blocks != model.config.num_hidden_layers:
         raise ValueError("Partition depth does not match model depth")
     partition.validate()
@@ -74,5 +76,4 @@ def replay_partition(
         site_distortions=errors,
         site_count=len(errors),
     )
-
 

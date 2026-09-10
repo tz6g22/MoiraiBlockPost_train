@@ -19,6 +19,8 @@ class MoiraiConfigBundle:
     query_path: Path
     query_sha256: str
     trainable_parameters: tuple[str, ...]
+    alpha_path: Path | None = None
+    alpha_sha256: str | None = None
 
     @classmethod
     def load(
@@ -74,6 +76,15 @@ class MoiraiConfigBundle:
         actual_query_hash = sha256_file(query_path)
         if actual_query_hash != manifest["query_sha256"]:
             raise ValueError("Query file hash does not match query manifest")
+        alpha_path = None
+        alpha_hash = None
+        if manifest.get("alpha_file") is not None:
+            alpha_path = manifest_path.parent / str(manifest["alpha_file"])
+            if not alpha_path.is_file():
+                raise FileNotFoundError(f"Alpha checkpoint is missing: {alpha_path}")
+            alpha_hash = sha256_file(alpha_path)
+            if alpha_hash != manifest.get("alpha_sha256"):
+                raise ValueError("Alpha checkpoint hash does not match query manifest")
         return cls(
             task=partition.task,
             base_checkpoint_sha256=expected_base_checkpoint_sha256,
@@ -81,6 +92,8 @@ class MoiraiConfigBundle:
             query_path=query_path,
             query_sha256=actual_query_hash,
             trainable_parameters=tuple(trainable_parameters),
+            alpha_path=alpha_path,
+            alpha_sha256=alpha_hash,
         )
 
     def apply_to_model(self, model) -> None:
@@ -93,7 +106,19 @@ class MoiraiConfigBundle:
             state,
             lambda name, _parameter: "pseudo_query" in name,
         )
-        model.config.attnres_execution = "moirai"
+        if self.alpha_path is not None:
+            alpha_state = load_file(self.alpha_path)
+            expected_alpha = {
+                name for name, _ in model.named_parameters() if "alpha" in name
+            }
+            if set(alpha_state) != expected_alpha:
+                raise ValueError("Alpha checkpoint tensors do not match the model")
+            load_selected_parameter_state(
+                model,
+                alpha_state,
+                lambda name, _parameter: "alpha" in name,
+            )
+        model.config.attnres_execution = "formal" if self.alpha_path else "moirai"
         model.config.moirai_partition = list(self.partition.lengths)
         model.config.moirai_task = self.task
         model.config.use_cache = False

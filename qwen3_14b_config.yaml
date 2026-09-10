@@ -1,0 +1,377 @@
+# Qwen3-14B Task-Adaptive Inference Block AttnRes
+# Formal Post-Training Configuration
+#
+# 上位方法定义：
+#   Task_Adaptive_Inference_Block_AttnRes_SPEC_CN.md
+# 修改计划：
+#   Task_Adaptive_Inference_Block_AttnRes_MODIFICATION_PLAN.md
+#
+# 本文件只针对 Qwen3-14B 正式实验。
+# Fixed mode 完全禁用：不训练、不保存、不路由、不作为 Probe fallback。
+
+experiment:
+  name: qwen3_14b_task_adaptive_attnres
+  seed: 42
+  model_family: qwen3
+  model_size: 14b
+  mode: formal_posttraining
+
+model:
+  base_model_path: ${QWEN3_14B_PATH}
+  infer_architecture_from_checkpoint: true
+  dtype: bfloat16
+  use_cache_train: false
+  gradient_checkpointing: true
+  discovery_model_mode: original_pretrained_transformer
+
+attnres:
+  enabled_after_discovery_only: true
+  implementation: kimi_compatible_block_attnres
+
+  intra_block_residual_semantics: cumulative
+  embedding_is_independent_source: true
+  completed_block_representation: cumulative_residual
+  partial_block_representation: cumulative_residual
+
+  forbid_mean_pooling: true
+  forbid_learnable_block_summary: true
+  forbid_projection_summary: true
+  forbid_extra_block_encoder: true
+  forbid_new_source_semantics: true
+
+  query:
+    site_specific: true
+    task_specific: true
+    input_independent_parameter: true
+
+  alpha:
+    site_specific: true
+    task_specific: true
+    init: 0.0
+    purpose: identity_preserving_gate
+
+  recency_bias: false
+  delta_source_formulation: false
+  null_source_routing: false
+  manual_alpha_schedule: false
+
+tasks:
+  enabled:
+    - math
+    - multihop
+    - code
+
+  fixed:
+    enabled: false
+    train: false
+    checkpoint: false
+    route: false
+    fallback: false
+
+discovery:
+  enabled: true
+  model_mode: original_residual_only
+  ordinary_residual_cost_defined: false
+
+  forbid_attnres: true
+  forbid_query: true
+  forbid_alpha: true
+  forbid_true_moirai_replay: true
+  forbid_fixed_replay: true
+
+  undefined_cost_behavior: fail
+  undefined_cost_status: RESIDUAL_DISCOVERY_COST_UNDEFINED
+
+  cases:
+    math: 1000
+    multihop: 1000
+    code: 500
+
+  sample_from_final_task_mixture: true
+  exclude_from_posttraining: true
+
+  partition:
+    unit: complete_transformer_block
+    continuous: true
+    non_overlapping: true
+    full_coverage: true
+    block_length_constraints_from_partition_config: true
+    candidate_block_count_from_partition_config: true
+    no_adjacent_singletons: true
+    deterministic_tie_break: true
+
+  freeze_partition_after_discovery: true
+  hash_partition: true
+
+data:
+  budget_unit: non_padding_tokens
+
+  token_budget:
+    math: 10000000
+    multihop: 10000000
+    code: 10000000
+    total: 30000000
+
+  source_policy: local_first_then_external_topup
+
+  math:
+    local_sources:
+      - gsm8k
+      - svamp
+    external_topup_priority:
+      - math_train
+      - openmathinstruct2
+
+  multihop:
+    local_sources:
+      - clutrr
+      - hotpotqa
+    external_topup_priority:
+      - musique
+      - 2wikimultihopqa
+
+  code:
+    local_sources:
+      - mbpp
+    external_topup_priority:
+      - xcoder_80k
+
+  mixture_training: true
+  sequential_dataset_training: false
+  shuffle: true
+  interleave_across_sources: true
+  interleave_across_tasks: true
+
+  normalize_prompt_format: true
+  normalize_target_format: true
+  normalize_loss_mask: true
+
+  isolation:
+    stable_ids: true
+    hash_audit: true
+    discovery_vs_train_disjoint: true
+    probe_vs_train_disjoint: true
+    eval_vs_all_training_disjoint: true
+    exact_dedup: true
+    normalized_text_dedup: true
+
+training:
+  type: full_parameter_joint_posttraining
+  shared_backbone: true
+  task_specific_backbone_copies: false
+
+  train_backbone: true
+  train_query: true
+  train_alpha: true
+  train_partition: false
+
+  task_sampling:
+    strategy: balanced_by_token_budget
+    math_weight: 1.0
+    multihop_weight: 1.0
+    code_weight: 1.0
+
+  optimizer:
+    name: adamw
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+
+    parameter_groups:
+      backbone:
+        lr: 3.0e-6
+        weight_decay: 0.1
+
+      attnres:
+        lr: 3.0e-5
+        weight_decay: 0.0
+
+    preserve_lr_ratio: true
+
+  scheduler:
+    type: cosine
+    warmup_ratio: 0.03
+    min_lr_ratio: 0.1
+
+  clipping:
+    max_grad_norm: 1.0
+
+  loss:
+    type: causal_lm_cross_entropy
+    supervise_prompt: false
+    supervise_target: true
+    supervise_eos: true
+    ignore_padding: true
+
+  precision:
+    compute: bfloat16
+    parameters: bfloat16
+    loss_accumulation: float32
+
+  batching:
+    micro_batch_size: auto_fit
+    gradient_accumulation_steps: auto_from_target_global_tokens
+    dynamic_padding: true
+    count_non_padding_tokens: true
+
+  stopping:
+    primary: token_budget
+    stop_when_all_task_budgets_reached: true
+
+  checkpointing:
+    save_final: true
+    save_optimizer_state: true
+    save_scheduler_state: true
+    save_rng_state: true
+    periodic_checkpointing: minimal
+
+distributed:
+  strategy: fsdp_or_zero2
+  activation_checkpointing: true
+
+  fsdp:
+    enabled_if_selected: true
+    sharding_strategy: full_shard
+    use_orig_params: true
+    limit_all_gathers: true
+
+  deepspeed:
+    enabled_if_selected: true
+    zero_stage: 2
+
+  mutually_exclusive_backend: true
+
+identity_test:
+  required: true
+  before_training: true
+
+  compare:
+    - original_qwen3_14b
+    - converted_attnres_alpha_zero
+
+  fail_status: IDENTITY_CONVERSION_FAILED
+
+  metrics:
+    - max_abs_logit_diff
+    - mean_abs_logit_diff
+
+verification:
+  require_backbone_update: true
+  require_query_update: true
+  require_alpha_open: true
+  require_partition_unchanged: true
+  require_inactive_task_bank_unchanged: true
+
+  fail_if_backbone_unchanged: BACKBONE_NOT_UPDATED
+  fail_if_alpha_never_opens: ATTNRES_BRANCH_NEVER_OPENED
+
+probe:
+  enabled: true
+
+  labels:
+    - math
+    - multihop
+    - code
+
+  fixed_label: false
+  fixed_fallback: false
+
+  routing_rule: argmax_three_way
+  confidence_fallback: none
+
+  discard_hidden_after_routing: true
+  discard_kv_cache_after_routing: true
+  discard_all_probe_state: true
+
+inference:
+  routes:
+    math:
+      config_bundle: [P_math, Q_math, Alpha_math]
+    multihop:
+      config_bundle: [P_multihop, Q_multihop, Alpha_multihop]
+    code:
+      config_bundle: [P_code, Q_code, Alpha_code]
+
+  fixed_route: false
+  restart_original_input_from_layer0: true
+  refeed_original_tokens: true
+  keep_selected_route_for_full_generation: true
+  reprobe_per_token: false
+  allow_mid_generation_route_switch: false
+  reuse_probe_cache: false
+  reuse_cross_case_cache: false
+
+checkpoint:
+  save:
+    - base_model_hash
+    - shared_backbone_hash
+    - enabled_tasks
+    - partition_per_task
+    - partition_hash_per_task
+    - query_hash_per_task
+    - alpha_hash_per_task
+    - optimizer_config
+    - scheduler_config
+    - token_budget
+    - consumed_tokens_per_task
+    - data_manifest_hash
+    - seed
+
+  forbid_keys:
+    - P_fixed
+    - Q_fixed
+    - Alpha_fixed
+    - fixed_checkpoint
+    - fixed_fallback
+
+evaluation:
+  tasks:
+    - math
+    - multihop
+    - code
+
+  evaluate_fixed: false
+
+  per_case_record:
+    - case_id
+    - true_task
+    - probe_prediction
+    - selected_mode
+    - partition_hash
+    - query_hash
+    - alpha_statistics
+    - answer
+    - correctness
+    - latency
+    - peak_memory
+
+  aggregate:
+    - routing_accuracy
+    - end_to_end_accuracy
+    - task_specific_accuracy
+    - latency
+    - peak_memory
+
+fail_fast:
+  discovery_uses_attnres: true
+  discovery_uses_query: true
+  discovery_uses_alpha: true
+  residual_discovery_cost_undefined: true
+  identity_test_failed: true
+  backbone_not_updated: true
+  partition_changed: true
+  wrong_task_bank_loaded: true
+  alpha_never_opened: true
+  nan_or_inf_loss: true
+  data_leakage: true
+  checkpoint_mismatch: true
+
+legacy:
+  disable_fixed_mode: true
+
+  disable:
+    - true_moirai_compressed_replay
+    - frozen_backbone_query_only_training
+    - posttraining_partition_rediscovery
+    - fixed_discovery_fallback
+    - fixed_probe_fallback
+    - fixed_inference_route

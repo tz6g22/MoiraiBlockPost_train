@@ -21,6 +21,11 @@ def collect_full_reference(
     input_ids: torch.LongTensor,
     attention_mask: torch.Tensor,
 ) -> FullReference:
+    if getattr(model.config, "attnres_execution", None) == "formal":
+        raise RuntimeError(
+            "Formal Discovery cannot collect AttnRes observations; use the "
+            "ordinary residual reference path"
+        )
     if model.config.attnres_execution != "full":
         raise ValueError("Reference collection requires Full AttnRes execution")
     model.eval()
@@ -55,4 +60,3 @@ def collect_full_reference(
         mlp_outputs=mlp_outputs,
         attention_mask=attention_mask,
     )
-

@@ -32,7 +32,7 @@ FIXED_TRAINING_CASES = {"math": 1000, "multihop": 1000, "code": 200}
 
 
 def validate_fixed_adapter_config(config: dict[str, Any]) -> None:
-    validate_query_training_protocol(config, stage_name="Fixed query")
+    raise RuntimeError("Fixed mode is disabled by the formal Qwen3-14B pipeline")
     expected = {
         "num_transformer_blocks": 40,
         "source_tasks": list(FIXED_SOURCE_TASKS),
@@ -95,6 +95,7 @@ def _combined_examples(
 
 
 def main() -> None:
+    raise RuntimeError("Fixed query training is disabled by the formal Qwen3-14B pipeline")
     args = parse_args()
     config = load_yaml(args.config)
     validate_fixed_adapter_config(config)

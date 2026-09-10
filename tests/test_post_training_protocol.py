@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
@@ -44,12 +45,12 @@ def test_requested_case_counts_and_preserved_training_protocol() -> None:
     assert set(data["evaluation_sources"]) == {"math", "multihop", "code"}
     assert data["probe_sources"]["gsm8k_main_train"]["dataset_name"] == "gsm8k"
     assert data["counts"]["stage2_discovery"] == {
-        "math": 1000,
-        "multihop": 1000,
+        "math": 500,
+        "multihop": 500,
         "code": 200,
     }
-    assert data["discovery_sources"]["math"] == {"gsm8k": 500, "svamp": 500}
-    assert data["discovery_sources"]["multihop"] == {"clutrr": 1000}
+    assert data["discovery_sources"]["math"] == {"gsm8k": 250, "svamp": 250}
+    assert data["discovery_sources"]["multihop"] == {"clutrr": 500}
     assert data["discovery_sources"]["code"] == {"mbpp": 200}
     assert data["counts"]["stage3_adapter_train"] == 1000
     assert data["task_count_overrides"]["code"]["stage3_adapter_train"] == 200
@@ -67,14 +68,15 @@ def test_requested_case_counts_and_preserved_training_protocol() -> None:
     evaluation = load_yaml("configs/evaluation.yaml")
     validate_discovery_config(discovery)
     validate_adapter_config(adapter)
-    validate_fixed_adapter_config(fixed_adapter)
+    with pytest.raises(RuntimeError, match="Fixed mode is disabled"):
+        validate_fixed_adapter_config(fixed_adapter)
     validate_probe_config(probe)
     validate_evaluation_config(evaluation)
 
     assert discovery["tasks"] == ["math", "multihop", "code"]
     assert discovery["discovery_cases_per_task"] == {
-        "math": 1000,
-        "multihop": 1000,
+        "math": 500,
+        "multihop": 500,
         "code": 200,
     }
     assert probe["classes"] == {0: "math", 1: "multihop", 2: "code"}
@@ -194,8 +196,8 @@ def test_code_manifest_uses_one_pool_and_keeps_final_evaluation_isolated() -> No
 def test_every_stage_is_unique_and_final_eval_is_globally_unused() -> None:
     records = load_manifest("outputs/data/splits.json")
     expected = {
-        "math": {"stage2_discovery": 1000, "stage3_adapter_train": 1000},
-        "multihop": {"stage2_discovery": 1000, "stage3_adapter_train": 1000},
+        "math": {"stage2_discovery": 500, "stage3_adapter_train": 1000},
+        "multihop": {"stage2_discovery": 500, "stage3_adapter_train": 1000},
         "code": {"stage2_discovery": 200, "stage3_adapter_train": 200},
     }
     for task, stage_counts in expected.items():
@@ -290,7 +292,7 @@ def test_qwen3_14b_depth_uses_same_partition_rules() -> None:
         result.partition.validate()
 
 
-def test_three_class_probe_uses_fixed_only_below_confidence_threshold() -> None:
+def test_three_class_probe_routes_by_argmax_without_fallback() -> None:
     math_prediction = ProbePrediction(
         predicted_task="math",
         logits=(2.0, -1.0, -2.0),
@@ -317,7 +319,7 @@ def test_three_class_probe_uses_fixed_only_below_confidence_threshold() -> None:
         logits=(0.1, 0.0, -0.1),
         probabilities=(0.37, 0.33, 0.30),
     )
-    assert select_probe_config(low_confidence) == "fixed"
+    assert select_probe_config(low_confidence) == "math"
 
     illegal_prediction = ProbePrediction(
         predicted_task="fixed",
@@ -328,7 +330,7 @@ def test_three_class_probe_uses_fixed_only_below_confidence_threshold() -> None:
         select_probe_config(illegal_prediction)
 
 
-def test_inference_applies_code_or_fixed_as_an_atomic_bundle() -> None:
+def test_inference_applies_code_as_an_atomic_bundle() -> None:
     class FakeBundle:
         def __init__(self, task: str) -> None:
             self.partition = MoiraiPartition.from_lengths(
@@ -351,7 +353,7 @@ def test_inference_applies_code_or_fixed_as_an_atomic_bundle() -> None:
         tokenizer=SimpleNamespace(eos_token_id=1),
         bundles={
             task: FakeBundle(task)
-            for task in ("math", "multihop", "code", "fixed")
+            for task in ("math", "multihop", "code")
         },
         probe_head=torch.nn.Linear(4, 3),
         device=torch.device("cpu"),
@@ -377,21 +379,6 @@ def test_inference_applies_code_or_fixed_as_an_atomic_bundle() -> None:
     assert result.partition_sha256 == engine.bundles["code"].partition.sha256
     assert result.query_sha256 == "code-query"
 
-    engine.classify = lambda _ids, _mask: ProbePrediction(
-        predicted_task="code",
-        logits=(0.1, 0.0, 0.2),
-        probabilities=(0.32, 0.30, 0.38),
-    )
-    fallback = engine.infer(
-        torch.tensor([[2]], dtype=torch.long),
-        torch.ones((1, 1), dtype=torch.long),
-        maximum_new_tokens=1,
-    )
-    assert model.applied_task == "fixed"
-    assert fallback.probe.predicted_task == "code"
-    assert fallback.selected_config == "fixed"
-    assert fallback.partition_sha256 == engine.bundles["fixed"].partition.sha256
-    assert fallback.query_sha256 == "fixed-query"
 
 
 def test_hf_backbone_keys_load_without_changing_backbone_weights() -> None:
@@ -421,8 +408,9 @@ def test_hf_backbone_keys_load_without_changing_backbone_weights() -> None:
             for fragment in (
                 "pseudo_query",
                 "attn_key_norm",
-                "mlp_key_norm",
-                "final_key_norm",
+                    "mlp_key_norm",
+                    "final_key_norm",
+                    "alpha",
             )
         )
         for name in incompatible.missing_keys

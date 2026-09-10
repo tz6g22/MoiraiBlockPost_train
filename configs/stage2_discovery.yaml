@@ -1,11 +1,14 @@
 seed: 42
+model_mode: original_residual_only
+formal_discovery: true
+ordinary_residual_cost_defined: false
 base_checkpoint: outputs/base/qwen3_14b_full_attnres
 data_manifest: outputs/data/splits.json
 data_config: configs/data.yaml
 tasks: [math, multihop, code]
 discovery_cases_per_task:
-  math: 1000
-  multihop: 1000
+  math: 500
+  multihop: 500
   code: 200
 num_transformer_blocks: 40
 observation_site_count: 81

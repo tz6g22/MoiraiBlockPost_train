@@ -46,7 +46,7 @@ class InferenceResult:
 
 
 ALLOWED_PROBE_CLASSES = frozenset(CLASS_TO_TASK.values())
-ALLOWED_SELECTED_CONFIGS = ALLOWED_PROBE_CLASSES | {"fixed"}
+ALLOWED_SELECTED_CONFIGS = ALLOWED_PROBE_CLASSES
 
 
 def select_probe_config(
@@ -54,17 +54,15 @@ def select_probe_config(
     *,
     confidence_threshold: float = 0.5,
 ) -> str:
-    """Select a supervised task bundle or the low-confidence Fixed fallback."""
+    """Select exactly one of the three supervised task bundles."""
     assert prediction.predicted_task in ALLOWED_PROBE_CLASSES, (
         "Probe produced an illegal class: " f"{prediction.predicted_task!r}"
     )
-    if not 0.0 < confidence_threshold < 1.0:
+    # Confidence is recorded for diagnostics only.  The formal method routes
+    # by the three-way argmax task prediction.
+    if not 0.0 <= confidence_threshold <= 1.0:
         raise ValueError("Probe confidence threshold must be between zero and one")
-    selected_config = (
-        prediction.predicted_task
-        if prediction.confidence >= confidence_threshold
-        else "fixed"
-    )
+    selected_config = prediction.predicted_task
     assert selected_config in ALLOWED_SELECTED_CONFIGS, (
         "Probe selected an illegal formal config: " f"{selected_config!r}"
     )
@@ -81,14 +79,14 @@ class MoiraiInferenceEngine:
         probe_head: torch.nn.Linear,
         device: torch.device,
         confidence_threshold: float = 0.5,
+        probe_bundle: MoiraiConfigBundle | None = None,
     ) -> None:
         if set(bundles) != ALLOWED_SELECTED_CONFIGS:
-            raise ValueError(
-                "Inference requires math, multihop, code, and fixed bundles"
-            )
+            raise ValueError("Inference requires math, multihop, and code bundles")
         self.model = model
         self.tokenizer = tokenizer
         self.bundles = bundles
+        self.probe_bundle = probe_bundle or bundles["math"]
         self.probe_head = probe_head
         self.device = device
         self.confidence_threshold = confidence_threshold
@@ -103,6 +101,8 @@ class MoiraiInferenceEngine:
         device: torch.device | str | None = None,
         model=None,
         tokenizer=None,
+        formal_bundles: dict[str, MoiraiConfigBundle] | None = None,
+        probe_bundle: MoiraiConfigBundle | None = None,
     ) -> "MoiraiInferenceEngine":
         context = init_distributed(require_cuda=False)
         config = load_yaml(config_path)
@@ -125,25 +125,29 @@ class MoiraiInferenceEngine:
         )
         if checkpoint_manifest.get("model_weights_sha256") != base_hash:
             raise ValueError("Inference base checkpoint hash mismatch")
-        bundles = {
-            task: load_task_bundle(
+        if formal_bundles is None:
+            bundles = {
+                task: load_task_bundle(
+                    config,
+                    task=task,
+                    base_checkpoint_hash=base_hash,
+                )
+                for task in CLASS_TO_TASK.values()
+            }
+            probe_entry_bundle = bundles["math"]
+        else:
+            bundles = dict(formal_bundles)
+            if set(bundles) != ALLOWED_SELECTED_CONFIGS:
+                raise ValueError("Formal inference requires math, multihop, and code bundles")
+            probe_entry_bundle = probe_bundle or load_task_bundle(
                 config,
-                task=task,
+                task="math",
                 base_checkpoint_hash=base_hash,
             )
-            for task in CLASS_TO_TASK.values()
-        }
-        fixed_root = Path(config["query_root"]) / "fixed"
-        bundles["fixed"] = MoiraiConfigBundle.load(
-            partition_path=fixed_root / "partition.json",
-            query_manifest_path=fixed_root / "query_manifest.json",
-            expected_base_checkpoint_sha256=base_hash,
-        )
         probe_dir = Path(config["output_dir"])
         probe_manifest = json.loads(
             (probe_dir / "probe_manifest.json").read_text(encoding="utf-8")
         )
-        probe_entry_bundle = bundles["math"]
         if (
             probe_manifest.get("base_checkpoint_sha256") != base_hash
             or probe_manifest.get("partition_sha256")
@@ -170,14 +174,19 @@ class MoiraiInferenceEngine:
                 torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
                 low_cpu_mem_usage=True,
             )
-            bundles["math"].apply_to_model(model)
+            probe_entry_bundle.apply_to_model(model)
             for parameter in model.parameters():
                 parameter.requires_grad_(False)
             model = wrap_qwen3_fsdp(
                 model,
                 context,
                 decoder_layer_classes=(MoiraiQwen3DecoderLayer,),
+                # Each rank has validated the same base checkpoint hash. Build
+                # FSDP on CPU to avoid a full-parameter GPU initialization peak.
+                sync_module_states=False,
+                device_id=None,
             )
+            model = model.to(device)
         if tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(
                 checkpoint,
@@ -196,6 +205,7 @@ class MoiraiInferenceEngine:
             model=model,
             tokenizer=tokenizer,
             bundles=bundles,
+            probe_bundle=probe_entry_bundle,
             probe_head=head,
             device=device,
             confidence_threshold=confidence_threshold,
@@ -208,7 +218,7 @@ class MoiraiInferenceEngine:
         attention_mask: torch.LongTensor,
     ) -> ProbePrediction:
         try:
-            self.bundles["math"].apply_to_model(self.model)
+            self.probe_bundle.apply_to_model(self.model)
             if self.model.config.moirai_task != "math":
                 raise RuntimeError("Probe entry is not Config_math")
             shallow_output = self.model(

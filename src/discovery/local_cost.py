@@ -58,6 +58,8 @@ def local_surrogate_interval_cost(
     end: int,
 ) -> tuple[torch.Tensor, int]:
     """Section 15 local intervention without re-running Attention or MLP."""
+    if getattr(model.config, "attnres_execution", None) == "formal":
+        raise RuntimeError("Formal Discovery cannot use AttnRes local surrogate cost")
     transformer_blocks = model.config.num_hidden_layers
     if not (0 <= start <= end < transformer_blocks):
         raise ValueError("Candidate interval is outside the Transformer depth")

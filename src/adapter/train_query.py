@@ -46,6 +46,7 @@ from src.distributed.fsdp_utils import (
 )
 from src.modeling.full_attnres import MoiraiQwen3DecoderLayer, MoiraiQwen3ForCausalLM
 from src.modeling.partition import MoiraiPartition
+from src.formal.runtime import build_joint_optimizer, trainability_audit
 from src.training.checkpointing import (
     pseudo_query_sha256,
     validate_post_training_base_manifest,
@@ -53,6 +54,39 @@ from src.training.checkpointing import (
 
 
 TRAINING_TOKEN_UNIT = "nonpadding_input"
+
+
+def validate_formal_training_config(config: dict[str, Any]) -> None:
+    """Validate the new full-parameter task-adaptive training policy."""
+    if config.get("type") != "full_parameter_joint_posttraining":
+        raise ValueError("Formal training must use full_parameter_joint_posttraining")
+    if config.get("shared_backbone") is not True:
+        raise ValueError("Formal training requires one shared backbone")
+    if config.get("train_backbone") is not True or config.get("train_query") is not True:
+        raise ValueError("Formal training must update backbone and query")
+    if config.get("train_alpha") is not True or config.get("train_partition") is not False:
+        raise ValueError("Formal training requires trainable alpha and frozen partition")
+
+
+def build_formal_optimizer(model, training_config: dict[str, Any]) -> torch.optim.Optimizer:
+    """Construct the config-defined backbone/AttnRes optimizer groups."""
+    validate_formal_training_config(training_config)
+    optimizer_config = training_config["optimizer"]
+    groups = optimizer_config["parameter_groups"]
+    return build_joint_optimizer(
+        model,
+        backbone_lr=float(groups["backbone"]["lr"]),
+        attnres_lr=float(groups["attnres"]["lr"]),
+        backbone_weight_decay=float(groups["backbone"]["weight_decay"]),
+        attnres_weight_decay=float(groups["attnres"]["weight_decay"]),
+        betas=tuple(optimizer_config["betas"]),
+        eps=float(optimizer_config["eps"]),
+    )
+
+
+def formal_trainability_audit(model) -> dict[str, object]:
+    """Audit that backbone, active Q and active Alpha are all trainable."""
+    return trainability_audit(model)
 
 
 def query_parameter_names(model) -> tuple[str, ...]:
@@ -439,7 +473,11 @@ def train_query_partition(
         model,
         context,
         decoder_layer_classes=(MoiraiQwen3DecoderLayer,),
+        sync_module_states=False,
+        device_id=None,
     )
+    if context.distributed:
+        model = model.to(device)
     if trainable_parameter_names(model) != tuple(expected_q_full_names):
         raise RuntimeError("FSDP optimizer parameter set is not exactly pseudo-query")
 
@@ -674,7 +712,7 @@ def validate_query_training_protocol(
         "use_cache": False,
         "trainable_parameters": "pseudo_query_only",
         "optimizer": "AdamW",
-        "learning_rate": 1.0e-3,
+        "learning_rate": config.get("learning_rate"),
         "betas": [0.9, 0.999],
         "eps": 1.0e-8,
         "weight_decay": 0.0,
