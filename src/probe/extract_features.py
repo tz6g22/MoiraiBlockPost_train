@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -49,13 +50,16 @@ def _weight_hash(checkpoint: Path) -> str:
     return actual
 
 
-def validate_probe_config(config: dict[str, Any]) -> None:
+def validate_probe_config(
+    config: dict[str, Any],
+    *,
+    hidden_size: int | None = None,
+) -> None:
     expected = {
         "seed": 42,
         "probe_entry_task": "math",
         "feature_site": "transformer_block_0_output",
         "pooling": "mask_aware_mean",
-        "classifier": "Linear(5120,3)",
         "confidence_threshold": 0.5,
         "max_epochs": 20,
         "learning_rate": 1.0e-3,
@@ -67,6 +71,11 @@ def validate_probe_config(config: dict[str, Any]) -> None:
                 f"Probe config mismatch for {key}: expected {value!r}, "
                 f"got {config.get(key)!r}"
             )
+    classifier = config.get("classifier")
+    if not isinstance(classifier, str) or re.fullmatch(r"Linear\([0-9]+,3\)", classifier) is None:
+        raise ValueError("Probe classifier must be Linear(hidden_size,3)")
+    if hidden_size is not None and classifier != f"Linear({hidden_size},3)":
+        raise ValueError("Probe classifier width does not match model hidden_size")
     for key in ("feature_batch_size", "batch_size"):
         if int(config.get(key, 0)) <= 0:
             raise ValueError(f"Probe {key} must be positive")

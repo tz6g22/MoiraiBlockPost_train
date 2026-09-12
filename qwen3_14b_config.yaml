@@ -24,6 +24,15 @@ model:
   gradient_checkpointing: true
   discovery_model_mode: original_pretrained_transformer
 
+pipeline:
+  data_config: configs/data.yaml
+  data_manifest: outputs/data/splits.json
+  discovery_output: outputs/formal/discovery_formal
+  joint_checkpoint_output: outputs/formal/joint_checkpoint
+  probe_output: outputs/formal/probe
+  evaluation_output: outputs/formal/evaluation
+  max_sequence_length: 2048
+
 attnres:
   enabled_after_discovery_only: true
   implementation: kimi_compatible_block_attnres
@@ -71,7 +80,7 @@ tasks:
 discovery:
   enabled: true
   model_mode: original_residual_only
-  ordinary_residual_cost_defined: false
+  ordinary_residual_cost_defined: true
 
   forbid_attnres: true
   forbid_query: true
@@ -80,7 +89,6 @@ discovery:
   forbid_fixed_replay: true
 
   undefined_cost_behavior: fail
-  undefined_cost_status: RESIDUAL_DISCOVERY_COST_UNDEFINED
 
   cases:
     math: 1000
@@ -97,6 +105,10 @@ discovery:
     full_coverage: true
     block_length_constraints_from_partition_config: true
     candidate_block_count_from_partition_config: true
+    fixed_block_size: 4
+    num_blocks_policy: ceil_num_layers_over_fixed_block_size
+    min_block_length: 2
+    max_block_length: 6
     no_adjacent_singletons: true
     deterministic_tie_break: true
 
@@ -208,8 +220,10 @@ training:
     loss_accumulation: float32
 
   batching:
-    micro_batch_size: auto_fit
-    gradient_accumulation_steps: auto_from_target_global_tokens
+    # The formal trainer executes one dynamically padded case per optimizer step.
+    # Token budgets are still counted from the actual non-padding input tokens.
+    micro_batch_size: 1
+    gradient_accumulation_steps: 1
     dynamic_padding: true
     count_non_padding_tokens: true
 
@@ -225,8 +239,14 @@ training:
     periodic_checkpointing: minimal
 
 distributed:
-  strategy: fsdp_or_zero2
+  # The formal implementation currently executes the FSDP path below.
+  # Keep the selected backend explicit so this config is reproducible.
+  strategy: fsdp
   activation_checkpointing: true
+  discovery_processes_per_node: 4
+  discovery_master_port: 29517
+  formal_processes_per_node: 4
+  formal_master_port: 29518
 
   fsdp:
     enabled_if_selected: true
@@ -235,7 +255,7 @@ distributed:
     limit_all_gathers: true
 
   deepspeed:
-    enabled_if_selected: true
+    enabled_if_selected: false
     zero_stage: 2
 
   mutually_exclusive_backend: true
@@ -267,6 +287,13 @@ verification:
 probe:
   enabled: true
 
+  seed: 42
+  feature_batch_size: 1
+  batch_size: 32
+  max_epochs: 20
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+
   labels:
     - math
     - multihop
@@ -276,6 +303,8 @@ probe:
   fixed_fallback: false
 
   routing_rule: argmax_three_way
+  # Reporting threshold only; routing always remains three-way argmax.
+  high_confidence_threshold: 0.5
   confidence_fallback: none
 
   discard_hidden_after_routing: true
@@ -328,6 +357,11 @@ evaluation:
     - math
     - multihop
     - code
+
+  max_new_tokens:
+    math: 128
+    multihop: 16
+    code: 256
 
   evaluate_fixed: false
 

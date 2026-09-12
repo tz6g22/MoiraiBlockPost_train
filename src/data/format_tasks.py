@@ -71,6 +71,39 @@ def load_dataset_pool(
     return pool
 
 
+def canonical_stable_id(
+    dataset_name: str,
+    official_split: str,
+    row: dict[str, Any],
+    field_mapping: dict[str, Any],
+) -> str:
+    """Recompute the manifest identity from the source row."""
+    field = field_mapping.get("id")
+    try:
+        value = nested_value(row, str(field)) if field else None
+    except KeyError:
+        value = None
+    if value is None or not str(value):
+        identity_fields = [
+            field_mapping.get("question"),
+            field_mapping.get("target"),
+            field_mapping.get("answer"),
+        ]
+        text_fields = field_mapping.get("text_fields", [])
+        identity_fields.extend(text_fields if isinstance(text_fields, list) else [])
+        values = []
+        for identity_field in identity_fields:
+            if identity_field:
+                values.append(str(nested_value(row, str(identity_field))))
+        if not values:
+            raise ValueError(
+                f"{dataset_name}/{official_split} row has no stable identifier"
+            )
+        value = "\n".join(values)
+    digest = hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+    return f"{dataset_name}::{official_split}::{digest}"
+
+
 def format_clutrr_prompt(
     row: dict,
     field_mapping: dict[str, Any] | None = None,
@@ -85,6 +118,43 @@ def format_clutrr_prompt(
         f"Query: {query}\n"
         "Relationship:"
     )
+
+
+def _hotpotqa_context_text(context: Any) -> str:
+    if not isinstance(context, dict):
+        raise ValueError("HotpotQA context must be a mapping")
+    titles = context.get("title")
+    sentences = context.get("sentences")
+    if not isinstance(titles, (list, tuple)) or not isinstance(
+        sentences, (list, tuple)
+    ):
+        raise ValueError("HotpotQA context requires title and sentences lists")
+    if len(titles) != len(sentences):
+        raise ValueError("HotpotQA context title/sentence lengths differ")
+    passages: list[str] = []
+    for title, paragraph in zip(titles, sentences):
+        if not isinstance(paragraph, (list, tuple)):
+            raise ValueError("HotpotQA context sentences must be nested lists")
+        text = " ".join(str(sentence).strip() for sentence in paragraph).strip()
+        if text:
+            passages.append(f"{str(title).strip()}: {text}")
+    if not passages:
+        raise ValueError("HotpotQA context must contain non-empty passages")
+    return "\n".join(passages)
+
+
+def format_hotpotqa_prompt(
+    row: dict,
+    field_mapping: dict[str, Any] | None = None,
+) -> str:
+    mapping = field_mapping or {}
+    context = _hotpotqa_context_text(
+        nested_value(row, str(mapping.get("context", "context")))
+    )
+    question = str(nested_value(row, str(mapping.get("question", "question")))).strip()
+    if not question:
+        raise ValueError("HotpotQA row requires a non-empty question")
+    return f"Context:\n{context}\nQuestion: {question}\nAnswer:"
 
 
 TASK_TO_SOURCE = {
@@ -120,6 +190,8 @@ def format_task_prompt(
         question = str(nested_value(row, str(field_mapping["question"]))).strip()
         return f"Question: {question}\nAnswer:"
     if task == "multihop":
+        if "context" in field_mapping:
+            return format_hotpotqa_prompt(row, field_mapping)
         return format_clutrr_prompt(row, field_mapping)
     if task == "code":
         prompt = str(nested_value(row, str(field_mapping["prompt"]))).strip()
@@ -155,6 +227,12 @@ def canonical_content_sha256(
         payload = {
             "story": nested_value(row, str(field_mapping["story"])),
             "query": nested_value(row, str(field_mapping["query"])),
+            "target": nested_value(row, str(field_mapping["target"])),
+        }
+    elif dataset_name == "hotpotqa":
+        payload = {
+            "question": nested_value(row, str(field_mapping["question"])),
+            "context": nested_value(row, str(field_mapping["context"])),
             "target": nested_value(row, str(field_mapping["target"])),
         }
     elif dataset_name in {"gsm8k", "svamp"}:
@@ -230,6 +308,33 @@ def _encode_multihop_prompt(
     return prefix_ids + context_ids + suffix_ids, truncated_tokens > 0, truncated_tokens
 
 
+def _encode_hotpotqa_prompt(
+    tokenizer,
+    row: dict[str, Any],
+    field_mapping: dict[str, Any],
+    *,
+    token_budget: int,
+) -> tuple[list[int], bool, int]:
+    context = _hotpotqa_context_text(
+        nested_value(row, str(field_mapping.get("context", "context")))
+    )
+    question = str(
+        nested_value(row, str(field_mapping.get("question", "question")))
+    ).strip()
+    prefix = "Context:\n"
+    suffix = f"\nQuestion: {question}\nAnswer:"
+    prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+    context_ids = tokenizer.encode(context, add_special_tokens=False)
+    suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+    fixed = len(prefix_ids) + len(suffix_ids)
+    if fixed > token_budget:
+        raise ValueError("HotpotQA question plus answer marker exceeds token budget")
+    keep = token_budget - fixed
+    truncated_tokens = max(0, len(context_ids) - keep)
+    context_ids = context_ids[:keep]
+    return prefix_ids + context_ids + suffix_ids, truncated_tokens > 0, truncated_tokens
+
+
 def encode_prompt_only(
     tokenizer,
     *,
@@ -249,7 +354,14 @@ def encode_prompt_only(
             "Math Probe input is unavailable: the dataset schema does not "
             "separate the input from the answer or solution"
         )
-    if task == "multihop":
+    if task == "multihop" and "context" in field_mapping:
+        token_ids, truncated, truncated_tokens = _encode_hotpotqa_prompt(
+            tokenizer,
+            row,
+            field_mapping,
+            token_budget=max_length,
+        )
+    elif task == "multihop":
         token_ids, truncated, truncated_tokens = _encode_multihop_prompt(
             tokenizer,
             row,
@@ -291,7 +403,14 @@ def encode_prompt_target(
     if len(target_ids) > max_length:
         raise ValueError(f"{task} target exceeds the fixed sequence length")
     prompt_budget = max_length - len(target_ids)
-    if task == "multihop":
+    if task == "multihop" and "context" in field_mapping:
+        prompt_ids, _, _ = _encode_hotpotqa_prompt(
+            tokenizer,
+            row,
+            field_mapping,
+            token_budget=prompt_budget,
+        )
+    elif task == "multihop":
         prompt_ids, _, _ = _encode_multihop_prompt(
             tokenizer,
             row,

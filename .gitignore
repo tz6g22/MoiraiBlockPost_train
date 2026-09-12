@@ -8,3 +8,23 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 
+# Local-only model/checkpoint, logs, and credential material.
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.log
+*.tmp
+.env
+.env.*
+*.pem
+*.key
+*credentials*
+*secret*
+
+# Audit and handoff notes are kept local for this migration.
+MIGRATION_MANIFEST.md
+HANDOFF.md
+SPEC_COMPLIANCE_AUDIT.md
+RESIDUAL_DISCOVERY_DESIGN.md

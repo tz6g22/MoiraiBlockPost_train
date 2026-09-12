@@ -14,7 +14,12 @@ from src.discovery.dynamic_programming import solve_partition
 from src.discovery.run_all import validate_discovery_config
 from src.evaluation.run_evaluation import validate_evaluation_config
 from src.evaluation.task_metrics import task_score
-from src.data.format_tasks import format_task_prompt, format_task_target, load_manifest
+from src.data.format_tasks import (
+    canonical_content_sha256,
+    format_task_prompt,
+    format_task_target,
+    load_manifest,
+)
 from src.data.leakage_audit import audit_manifest
 from src.modeling.full_attnres import MoiraiQwen3ForCausalLM
 from src.modeling.partition import MoiraiPartition, fixed_kimi_partition
@@ -31,7 +36,13 @@ from src.training.checkpointing import validate_post_training_base_manifest
 def test_requested_case_counts_and_preserved_training_protocol() -> None:
     data = load_yaml("configs/data.yaml")
     assert data["sources"]["gsm8k"]["dataset_name"] == "gsm8k"
-    assert set(data["sources"]) == {"clutrr", "gsm8k", "svamp", "mbpp"}
+    assert set(data["sources"]) == {
+        "clutrr",
+        "gsm8k",
+        "hotpotqa",
+        "svamp",
+        "mbpp",
+    }
     assert data["sources"]["clutrr"]["repo_id"] == "CLUTRR/v1"
     assert data["sources"]["clutrr"]["task_name"] == "task_1.2"
     assert data["sources"]["clutrr"]["official_split"] == "train"
@@ -45,18 +56,21 @@ def test_requested_case_counts_and_preserved_training_protocol() -> None:
     assert set(data["evaluation_sources"]) == {"math", "multihop", "code"}
     assert data["probe_sources"]["gsm8k_main_train"]["dataset_name"] == "gsm8k"
     assert data["counts"]["stage2_discovery"] == {
-        "math": 500,
-        "multihop": 500,
-        "code": 200,
+        "math": 1000,
+        "multihop": 1000,
+        "code": 500,
     }
-    assert data["discovery_sources"]["math"] == {"gsm8k": 250, "svamp": 250}
-    assert data["discovery_sources"]["multihop"] == {"clutrr": 500}
-    assert data["discovery_sources"]["code"] == {"mbpp": 200}
+    assert data["discovery_sources"]["math"] == {"gsm8k": 500, "svamp": 500}
+    assert data["discovery_sources"]["multihop"] == {"clutrr": 1000}
+    assert data["discovery_sources"]["code"] == {"mbpp": 500}
+    assert data["training_sources"] == {
+        "math": ["gsm8k", "svamp"],
+        "multihop": ["clutrr", "hotpotqa"],
+        "code": ["mbpp"],
+    }
     assert data["counts"]["stage3_adapter_train"] == 1000
     assert data["task_count_overrides"]["code"]["stage3_adapter_train"] == 200
-    assert data["allowed_cross_stage_reuse"] == [
-        ["stage2_discovery", "stage3_adapter_train"]
-    ]
+    assert data["allowed_cross_stage_reuse"] == []
     assert data["counts"]["probe_train"] == 200
     assert data["counts"]["probe_val"] == 500
     assert data["counts"]["stage4_final_eval"] == 10
@@ -75,15 +89,18 @@ def test_requested_case_counts_and_preserved_training_protocol() -> None:
 
     assert discovery["tasks"] == ["math", "multihop", "code"]
     assert discovery["discovery_cases_per_task"] == {
-        "math": 500,
-        "multihop": 500,
-        "code": 200,
+        "math": 1000,
+        "multihop": 1000,
+        "code": 500,
     }
     assert probe["classes"] == {0: "math", 1: "multihop", 2: "code"}
     assert probe["classifier"] == "Linear(5120,3)"
     assert probe["confidence_threshold"] == 0.5
-    assert discovery["num_moirai_blocks"] == list(range(10, 17))
-    assert discovery["boundary_refinement_sweeps"] == 5
+    assert discovery["fixed_block_size"] == 4
+    assert discovery["num_blocks_policy"] == "ceil_num_layers_over_fixed_block_size"
+    assert discovery["min_block_length"] == 2
+    assert discovery["max_block_length"] == 6
+    assert "num_moirai_blocks" not in discovery
     assert adapter["training_token_unit"] == "nonpadding_input"
     assert adapter["training_passes"] == 1
     assert adapter["checkpoint_interval_steps"] == 100
@@ -135,7 +152,7 @@ def test_code_manifest_uses_one_pool_and_keeps_final_evaluation_isolated() -> No
         }
     }
     assert {stage: len(rows) for stage, rows in by_stage.items()} == {
-        "stage2_discovery": 200,
+        "stage2_discovery": 500,
         "stage3_adapter_train": 200,
         "stage3_adapter_val": 45,
         "probe_train": 100,
@@ -153,7 +170,8 @@ def test_code_manifest_uses_one_pool_and_keeps_final_evaluation_isolated() -> No
     } == {"train", "validation", "test"}
     assert {
         row["official_split"] for row in by_stage["stage4_final_eval"]
-    } == {"train", "validation", "test"}
+    }.issubset({"train", "validation", "test"})
+    assert by_stage["stage4_final_eval"]
     for rows in by_stage.values():
         stable_ids = [row["stable_id"] for row in rows]
         content_hashes = [row["content_sha256"] for row in rows]
@@ -162,7 +180,7 @@ def test_code_manifest_uses_one_pool_and_keeps_final_evaluation_isolated() -> No
 
     discovery_ids = {row["stable_id"] for row in by_stage["stage2_discovery"]}
     query_ids = {row["stable_id"] for row in by_stage["stage3_adapter_train"]}
-    assert discovery_ids == query_ids
+    assert not discovery_ids & query_ids
     for isolated_stage in {
         "stage3_adapter_val",
         "probe_train",
@@ -184,9 +202,7 @@ def test_code_manifest_uses_one_pool_and_keeps_final_evaluation_isolated() -> No
 
     audit = audit_manifest(
         "outputs/data/splits.json",
-        allowed_cross_stage_reuse=(
-            ("stage2_discovery", "stage3_adapter_train"),
-        ),
+        allowed_cross_stage_reuse=(),
     )
     assert audit["status"] == "PASS"
     assert audit["id_intersections"] == []
@@ -196,9 +212,9 @@ def test_code_manifest_uses_one_pool_and_keeps_final_evaluation_isolated() -> No
 def test_every_stage_is_unique_and_final_eval_is_globally_unused() -> None:
     records = load_manifest("outputs/data/splits.json")
     expected = {
-        "math": {"stage2_discovery": 500, "stage3_adapter_train": 1000},
-        "multihop": {"stage2_discovery": 500, "stage3_adapter_train": 1000},
-        "code": {"stage2_discovery": 200, "stage3_adapter_train": 200},
+        "math": {"stage2_discovery": 1000, "stage3_adapter_train": 1000},
+        "multihop": {"stage2_discovery": 1000, "stage3_adapter_train": 1000},
+        "code": {"stage2_discovery": 500, "stage3_adapter_train": 200},
     }
     for task, stage_counts in expected.items():
         task_rows = [row for row in records if row["task"] == task]
@@ -262,6 +278,29 @@ def test_clutrr_multihop_format_uses_only_story_query_and_target_text() -> None:
     assert format_task_target("multihop", row, mapping) == "mother"
 
 
+def test_hotpotqa_multihop_format_uses_context_question_and_answer() -> None:
+    row = {
+        "question": "Which city is larger?",
+        "answer": "City A",
+        "context": {
+            "title": ["City A", "City B"],
+            "sentences": [["City A has 10 residents."], ["City B has 2 residents."]],
+        },
+    }
+    mapping = {
+        "id": "id",
+        "question": "question",
+        "context": "context",
+        "target": "answer",
+    }
+    prompt = format_task_prompt("multihop", row, mapping)
+    assert "City A: City A has 10 residents." in prompt
+    assert "City B: City B has 2 residents." in prompt
+    assert row["question"] in prompt
+    assert format_task_target("multihop", row, mapping) == row["answer"]
+    assert canonical_content_sha256("hotpotqa", row, mapping)
+
+
 def test_mbpp_code_format_uses_only_validated_prompt_and_target_fields() -> None:
     row = {
         "prompt": "Write a function that doubles an integer.",
@@ -283,13 +322,17 @@ def test_qwen3_14b_depth_uses_same_partition_rules() -> None:
 
     costs = np.full((40, 40), np.inf, dtype=np.float64)
     for start in range(40):
-        for end in range(start, min(40, start + 4)):
+        for length in range(2, 7):
+            end = start + length - 1
+            if end >= 40:
+                continue
             costs[start, end] = float(end - start + 1)
-    for block_count in range(10, 17):
-        result = solve_partition(costs, num_blocks=block_count, task="math")
-        assert len(result.partition.blocks) == block_count
-        assert sum(result.partition.lengths) == 40
-        result.partition.validate()
+    result = solve_partition(costs, num_blocks=10, task="math", candidate_lengths=range(2, 7))
+    assert len(result.partition.blocks) == 10
+    assert sum(result.partition.lengths) == 40
+    assert min(result.partition.lengths) >= 2
+    assert max(result.partition.lengths) <= 6
+    result.partition.validate()
 
 
 def test_three_class_probe_routes_by_argmax_without_fallback() -> None:

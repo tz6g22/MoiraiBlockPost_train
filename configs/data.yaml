@@ -10,7 +10,7 @@ counts:
   stage2_discovery:
     math: 1000
     multihop: 1000
-    code: 200
+    code: 500
   stage3_adapter_train: 1000
   stage3_adapter_val: 500
   probe_train: 200
@@ -24,8 +24,7 @@ task_count_overrides:
     probe_train: 100
     probe_val: 45
 
-allowed_cross_stage_reuse:
-  - [stage2_discovery, stage3_adapter_train]
+allowed_cross_stage_reuse: []
 
 sources:
   gsm8k:
@@ -58,6 +57,22 @@ sources:
       story: story
       query: query
       target: target_text
+
+  hotpotqa:
+    dataset_name: hotpotqa
+    repo_id: hotpotqa/hotpot_qa
+    subset: distractor
+    local_path: ../data/pretraining/hotpotqa_train
+    # This local snapshot is identified by its source dataset metadata hash;
+    # no network fetch is permitted by the formal pipeline.
+    revision: local-dataset-info-sha256-3f8162c114ccf70b984c692d9bc205d2f81507faa774fccdc4581ba5a62c4fad
+    official_split: train
+    expected_rows: 90447
+    field_mapping:
+      id: id
+      question: question
+      context: context
+      target: answer
 
   svamp:
     dataset_name: svamp
@@ -96,7 +111,19 @@ discovery_sources:
   multihop:
     clutrr: 1000
   code:
-    mbpp: 200
+    mbpp: 500
+
+training_sources:
+  # Stage-3 examples are drawn from this task-local mixture and remain
+  # disjoint from Discovery through the global assignment audit.
+  math:
+    - gsm8k
+    - svamp
+  multihop:
+    - clutrr
+    - hotpotqa
+  code:
+    - mbpp
 
 validation_sources:
   multihop:

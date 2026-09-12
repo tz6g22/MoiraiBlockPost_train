@@ -3,7 +3,7 @@ base_checkpoint: outputs/base/qwen3_14b_full_attnres
 data_manifest: outputs/data/splits.json
 data_config: configs/data.yaml
 partition_root: outputs/formal/discovery
-query_root: outputs/formal/adapter
+query_root: outputs/formal/adapter_lr3e-5
 probe_config: configs/probe.yaml
 output_dir: outputs/formal/evaluation
 use_cache: false

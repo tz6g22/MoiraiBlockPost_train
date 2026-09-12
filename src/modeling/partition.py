@@ -32,6 +32,9 @@ class MoiraiPartition:
     task: str
     num_transformer_blocks: int
     blocks: tuple[MoiraiBlock, ...]
+    min_block_length: int = 1
+    max_block_length: int = 4
+    no_adjacent_singletons: bool = True
 
     @classmethod
     def from_lengths(
@@ -40,6 +43,9 @@ class MoiraiPartition:
         *,
         task: str,
         num_transformer_blocks: int = 32,
+        min_length: int = 1,
+        max_length: int = 4,
+        no_adjacent_singletons: bool = True,
     ) -> "MoiraiPartition":
         blocks: list[MoiraiBlock] = []
         start = 0
@@ -53,6 +59,9 @@ class MoiraiPartition:
             task=task,
             num_transformer_blocks=num_transformer_blocks,
             blocks=tuple(blocks),
+            min_block_length=min_length,
+            max_block_length=max_length,
+            no_adjacent_singletons=no_adjacent_singletons,
         )
         partition.validate()
         return partition
@@ -66,6 +75,14 @@ class MoiraiPartition:
         raw_blocks = payload["blocks"]
         if not isinstance(raw_blocks, list):
             raise TypeError("partition.blocks must be a list")
+        constraints = payload.get("constraints", {})
+        if not isinstance(constraints, dict):
+            raise TypeError("partition.constraints must be a mapping")
+        min_length = int(constraints.get("min_length", 1))
+        max_length = int(constraints.get("max_length", 4))
+        no_adjacent_singletons = bool(
+            constraints.get("no_adjacent_singletons", True)
+        )
         blocks: list[MoiraiBlock] = []
         for raw in raw_blocks:
             if not isinstance(raw, dict):
@@ -88,6 +105,9 @@ class MoiraiPartition:
             task=str(payload["task"]),
             num_transformer_blocks=int(payload["num_transformer_blocks"]),
             blocks=tuple(blocks),
+            min_block_length=min_length,
+            max_block_length=max_length,
+            no_adjacent_singletons=no_adjacent_singletons,
         )
         partition.validate()
         declared_hash = payload.get("partition_sha256")
@@ -114,10 +134,19 @@ class MoiraiPartition:
     def validate(
         self,
         *,
-        min_length: int = 1,
-        max_length: int = 4,
-        no_adjacent_singletons: bool = True,
+        min_length: int | None = None,
+        max_length: int | None = None,
+        no_adjacent_singletons: bool | None = None,
     ) -> None:
+        min_length = self.min_block_length if min_length is None else min_length
+        max_length = self.max_block_length if max_length is None else max_length
+        no_adjacent_singletons = (
+            self.no_adjacent_singletons
+            if no_adjacent_singletons is None
+            else no_adjacent_singletons
+        )
+        if min_length <= 0 or max_length < min_length:
+            raise ValueError("Partition length constraints are invalid")
         if not self.task:
             raise ValueError("Partition task must be non-empty")
         if self.num_transformer_blocks <= 0:
@@ -154,9 +183,9 @@ class MoiraiPartition:
             "num_transformer_blocks": self.num_transformer_blocks,
             "blocks": [block.to_dict() for block in self.blocks],
             "constraints": {
-                "min_length": 1,
-                "max_length": 4,
-                "no_adjacent_singletons": True,
+                "min_length": self.min_block_length,
+                "max_length": self.max_block_length,
+                "no_adjacent_singletons": self.no_adjacent_singletons,
                 "continuous": True,
             },
         }
@@ -189,11 +218,16 @@ def fixed_kimi_partition(
     *,
     task: str = "fixed",
     num_transformer_blocks: int = 32,
+    block_size: int = 4,
 ) -> MoiraiPartition:
-    if num_transformer_blocks % 4 != 0:
-        raise ValueError("Fixed Kimi baseline requires depth divisible by four")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    full_blocks, remainder = divmod(num_transformer_blocks, block_size)
+    lengths = [block_size] * full_blocks
+    if remainder:
+        lengths.append(remainder)
     return MoiraiPartition.from_lengths(
-        [4] * (num_transformer_blocks // 4),
+        lengths,
         task=task,
         num_transformer_blocks=num_transformer_blocks,
     )

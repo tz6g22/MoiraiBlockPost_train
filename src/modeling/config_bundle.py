@@ -121,6 +121,9 @@ class MoiraiConfigBundle:
         model.config.attnres_execution = "formal" if self.alpha_path else "moirai"
         model.config.moirai_partition = list(self.partition.lengths)
         model.config.moirai_task = self.task
+        model.config.moirai_min_block_length = self.partition.min_block_length
+        model.config.moirai_max_block_length = self.partition.max_block_length
+        model.config.moirai_no_adjacent_singletons = self.partition.no_adjacent_singletons
         model.config.use_cache = False
 
 

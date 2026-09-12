@@ -40,6 +40,9 @@ class MoiraiQwen3Config(Qwen3Config):
         attnres_execution: ExecutionMode = "full",
         moirai_partition: list[int] | None = None,
         moirai_task: str = "unassigned",
+        moirai_min_block_length: int = 1,
+        moirai_max_block_length: int = 4,
+        moirai_no_adjacent_singletons: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -48,6 +51,9 @@ class MoiraiQwen3Config(Qwen3Config):
         self.attnres_execution = attnres_execution
         self.moirai_partition = moirai_partition
         self.moirai_task = moirai_task
+        self.moirai_min_block_length = moirai_min_block_length
+        self.moirai_max_block_length = moirai_max_block_length
+        self.moirai_no_adjacent_singletons = moirai_no_adjacent_singletons
 
 
 @dataclass(frozen=True)
@@ -124,8 +130,10 @@ class MoiraiQwen3DecoderLayer(nn.Module):
         # Formal task-specific gates are zero at conversion time.  They blend
         # the Kimi-routed branch with the native residual stream without
         # changing the Kimi cumulative block source semantics.
-        self.attn_alpha = nn.Parameter(torch.zeros(()))
-        self.mlp_alpha = nn.Parameter(torch.zeros(()))
+        # FSDP requires managed parameters to have at least one dimension.
+        # A length-one tensor remains a per-site scalar under broadcasting.
+        self.attn_alpha = nn.Parameter(torch.zeros(1))
+        self.mlp_alpha = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -138,7 +146,8 @@ class MoiraiQwen3DecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         surrogate_attention_output: torch.Tensor | None = None,
         native_hidden: torch.Tensor | None = None,
-    ) -> tuple[
+        native_only: bool = False,
+    ) -> torch.Tensor | tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -147,6 +156,26 @@ class MoiraiQwen3DecoderLayer(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
+        if native_only:
+            if native_hidden is None:
+                raise ValueError("Native-only decoder execution requires hidden states")
+            if position_ids is None or cache_position is None or position_embeddings is None:
+                raise ValueError("Native-only decoder execution requires position information")
+            attn_output, _ = self.self_attn(
+                hidden_states=self.input_layernorm(native_hidden),
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=False,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+            native_after_attention = native_hidden + attn_output
+            mlp_output = self.mlp(
+                self.post_attention_layernorm(native_after_attention)
+            )
+            return native_after_attention + mlp_output
+
         sources_before_attn = completed_sources
         if partial_block is not None:
             sources_before_attn = sources_before_attn + (partial_block,)
@@ -227,7 +256,7 @@ class MoiraiQwen3Model(Qwen3PreTrainedModel):
         )
         self.final_pseudo_query = nn.Parameter(torch.zeros(config.hidden_size))
         self.final_key_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.final_alpha = nn.Parameter(torch.zeros(()))
+        self.final_alpha = nn.Parameter(torch.zeros(1))
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
@@ -250,6 +279,11 @@ class MoiraiQwen3Model(Qwen3PreTrainedModel):
             lengths,
             task=self.config.moirai_task,
             num_transformer_blocks=self.config.num_hidden_layers,
+            min_length=int(getattr(self.config, "moirai_min_block_length", 1)),
+            max_length=int(getattr(self.config, "moirai_max_block_length", 4)),
+            no_adjacent_singletons=bool(
+                getattr(self.config, "moirai_no_adjacent_singletons", True)
+            ),
         )
 
     def _run_layer(
@@ -386,6 +420,29 @@ class MoiraiQwen3Model(Qwen3PreTrainedModel):
                 )
 
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+
+        # Probe features must be task-independent.  Reuse the shared backbone's
+        # native first block and do not touch partition, query, or alpha state.
+        if probe_layer0_only:
+            layer = self.layers[0]
+            native_layer_output = layer(
+                (),
+                None,
+                attention_mask=causal_mask_mapping[layer.attention_type],
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                native_hidden=inputs_embeds,
+                native_only=True,
+            )
+            if not isinstance(native_layer_output, torch.Tensor):
+                raise RuntimeError("Native-only Probe block returned routed outputs")
+            return BaseModelOutputWithPast(
+                last_hidden_state=native_layer_output,
+                past_key_values=None,
+            )
+
         partition = self._partition()
         boundary_ends = partition.boundary_ends if partition is not None else frozenset()
 
@@ -487,14 +544,6 @@ class MoiraiQwen3Model(Qwen3PreTrainedModel):
                 observations.extend((z_attn, z_mlp))
                 attention_outputs.append(attn_output)
                 mlp_outputs.append(mlp_output)
-            if probe_layer0_only:
-                if layer_idx != 0:
-                    raise RuntimeError("Probe shallow forward did not stop after layer 0")
-                return BaseModelOutputWithPast(
-                    last_hidden_state=layer_hidden,
-                    past_key_values=None,
-                )
-
             if partition is None:
                 # Full AttnRes preserves Attention and MLP outputs as two
                 # independent sources in execution order.

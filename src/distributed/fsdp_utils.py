@@ -16,7 +16,6 @@ from torch.distributed.fsdp import (
     ShardingStrategy,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
 
 
 ParameterPredicate = Callable[[str, nn.Parameter], bool]
@@ -135,16 +134,17 @@ def wrap_qwen3_fsdp(
     context: DistributedContext,
     *,
     decoder_layer_classes: Iterable[type[nn.Module]],
+    sync_module_states: bool = True,
+    device_id: torch.device | None = None,
 ) -> nn.Module:
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+
     expected_trainable = trainable_parameter_names(model)
     if not context.distributed:
         wrapped = model.to(context.device)
     else:
         layer_classes = {Qwen3DecoderLayer, *decoder_layer_classes}
-        if not any(
-            isinstance(module, tuple(layer_classes - {Qwen3DecoderLayer}))
-            for module in model.modules()
-        ):
+        if not any(isinstance(module, tuple(layer_classes)) for module in model.modules()):
             raise RuntimeError("No configured Qwen3 decoder-layer unit exists in the model")
         policy = partial(
             transformer_auto_wrap_policy,
@@ -161,8 +161,8 @@ def wrap_qwen3_fsdp(
             ),
             use_orig_params=True,
             limit_all_gathers=True,
-            sync_module_states=True,
-            device_id=context.device,
+            sync_module_states=sync_module_states,
+            device_id=device_id,
         )
     actual_trainable = trainable_parameter_names(wrapped)
     if actual_trainable != expected_trainable:

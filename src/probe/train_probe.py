@@ -73,8 +73,9 @@ def main() -> None:
     val_features = validation["features"].to(device)
     val_labels = validation["labels"].long().to(device)
     hidden_size = int(train_features.shape[1])
-    if hidden_size != 5120 or int(val_features.shape[1]) != hidden_size:
-        raise ValueError("Qwen3-14B probe features must have hidden size 5120")
+    if int(val_features.shape[1]) != hidden_size:
+        raise ValueError("Probe train and validation feature widths differ")
+    validate_probe_config(config, hidden_size=hidden_size)
     class_count = len(CLASS_TO_TASK)
     expected_labels = set(range(class_count))
     if set(train_labels.cpu().tolist()) != expected_labels:

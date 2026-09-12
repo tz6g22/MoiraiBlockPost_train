@@ -13,5 +13,5 @@ if [[ ! -x "$PYTHON" ]]; then
 fi
 
 printf '[formal] config=%s\n' "$CONFIG"
-printf '[formal] no formal training is started by this entry point.\n'
+printf '[formal] default stage is validate; pass --stage explicitly for later stages.\n'
 exec "$PYTHON" -m src.formal.pipeline --config "$CONFIG" "$@"

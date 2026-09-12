@@ -9,8 +9,8 @@ from typing import Any
 from src.common import canonical_json, load_yaml
 from src.data.format_tasks import (
     TASK_TO_SOURCE,
+    canonical_stable_id,
     canonical_content_sha256,
-    dataset_pool_sources,
     load_local_split,
     nested_value,
     task_split_count,
@@ -25,28 +25,7 @@ def _stable_id(
     row: dict[str, Any],
     mapping: dict[str, Any],
 ) -> str:
-    field = mapping.get("id")
-    try:
-        value = nested_value(row, str(field)) if field else None
-    except KeyError:
-        value = None
-    if value is None or not str(value):
-        identity_fields = [
-            mapping.get("question"),
-            mapping.get("target"),
-            mapping.get("answer"),
-        ]
-        text_fields = mapping.get("text_fields", [])
-        identity_fields.extend(text_fields if isinstance(text_fields, list) else [])
-        values = []
-        for identity_field in identity_fields:
-            if identity_field:
-                values.append(str(nested_value(row, str(identity_field))))
-        if not values:
-            raise ValueError(f"{dataset_name}/{split} row has no stable identifier")
-        value = "\n".join(values)
-    digest = hashlib.sha256(str(value).encode("utf-8")).hexdigest()
-    return f"{dataset_name}::{split}::{digest}"
+    return canonical_stable_id(dataset_name, split, row, mapping)
 
 
 def _order_key(seed: int, stable_id: str) -> str:
@@ -104,10 +83,21 @@ def _ordered_unique_pool(
     task: str,
     dataset_name: str,
     seed: int,
+    section_names: tuple[str, ...] = ("sources",),
 ) -> list[tuple[str, dict[str, Any], str, int, dict[str, Any]]]:
     rows: list[tuple[str, dict[str, Any], str, int, dict[str, Any]]] = []
     seen: set[str] = set()
-    for source in dataset_pool_sources(data_config, dataset_name):
+    candidates: dict[tuple[str, str], dict[str, Any]] = {}
+    for section_name in section_names:
+        for source in data_config.get(section_name, {}).values():
+            if source.get("dataset_name") == dataset_name:
+                key = (str(source["local_path"]), str(source["official_split"]))
+                candidates[key] = source
+    if not candidates:
+        raise ValueError(
+            f"No {dataset_name} source is configured in sections {section_names}"
+        )
+    for source in (candidates[key] for key in sorted(candidates)):
         split = str(source["official_split"])
         dataset = _load_source(source)
         for row_index in range(len(dataset)):
@@ -126,6 +116,73 @@ def _ordered_unique_pool(
             )
     rows.sort(key=lambda value: value[0])
     return rows
+
+
+def _ordered_unique_task_pool(
+    data_config: dict[str, Any],
+    *,
+    task: str,
+    source_keys: tuple[str, ...],
+    seed: int,
+    section_names: tuple[str, ...],
+) -> list[tuple[str, dict[str, Any], str, int, dict[str, Any]]]:
+    """Build one deterministic pool from several task-local source keys."""
+    if not source_keys:
+        raise ValueError(f"{task} has no configured source keys")
+    rows: list[tuple[str, dict[str, Any], str, int, dict[str, Any]]] = []
+    for source_key in source_keys:
+        source = data_config.get("sources", {}).get(source_key)
+        if source is None:
+            raise ValueError(
+                f"{task} source key {source_key!r} is not configured in sources"
+            )
+        rows.extend(
+            _ordered_unique_pool(
+                data_config,
+                task=task,
+                dataset_name=str(source["dataset_name"]),
+                seed=seed,
+                section_names=section_names,
+            )
+        )
+    rows.sort(key=lambda value: value[0])
+    return rows
+
+
+def _stage_source_sections(
+    data_config: dict[str, Any],
+    *,
+    task: str,
+    dataset_name: str,
+    stage: str,
+) -> tuple[str, ...]:
+    """Map each stage to an isolated source section.
+
+    Evaluation must never draw from the generic training pool.  A task without
+    a dedicated validation/probe source intentionally falls back to the
+    training source section; the global assignment audit still makes those
+    rows disjoint from earlier stages.
+    """
+    del task
+    if stage == "stage4_final_eval":
+        sections = ("evaluation_sources",)
+    elif stage == "stage3_adapter_val":
+        sections = (
+            ("validation_sources",)
+            if any(
+                source.get("dataset_name") == dataset_name
+                for source in data_config.get("validation_sources", {}).values()
+            )
+            else ("sources",)
+        )
+    elif stage in {"probe_train", "probe_val"}:
+        sections = (
+            "probe_sources",
+            "sources",
+        )
+    else:
+        sections = ("sources",)
+    return sections
 
 
 def _ordered_unique(
@@ -215,25 +272,18 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
     content_hash_splits: dict[str, set[str]] = {}
     configured_overlap_pairs = config.get("allowed_cross_stage_reuse", [])
     allowed_overlap_pairs = normalize_stage_overlap_pairs(configured_overlap_pairs)
-    expected_overlap_pairs = normalize_stage_overlap_pairs(
-        (("stage2_discovery", "stage3_adapter_train"),)
-    )
-    if allowed_overlap_pairs != expected_overlap_pairs:
-        raise ValueError(
-            "Only Discovery/Query Training cross-stage reuse may be configured"
-        )
     report: dict[str, Any] = {"tasks": {}, "counts": counts}
     discovery_sources = config["discovery_sources"]
 
     for task, source_key in TASK_TO_SOURCE.items():
         source = config["sources"][source_key]
-        pool_rows = _ordered_unique_pool(
-            config,
-            task=task,
-            dataset_name=str(source["dataset_name"]),
-            seed=seed,
+        dataset_name = str(source["dataset_name"])
+        training_source_keys = tuple(
+            str(value)
+            for value in config.get("training_sources", {}).get(task, (source_key,))
         )
-        primary_assignments = (
+        pool_available_by_stage: dict[str, dict[str, Any]] = {}
+        stage_counts = (
             (
                 "stage2_discovery",
                 int(discovery_sources[task].get(source_key, 0)),
@@ -263,22 +313,59 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
                 task_split_count(config, task=task, split_name="probe_val"),
             ),
         )
-        _append_assignments(
-            entries=entries,
-            stable_id_splits=stable_id_splits,
-            content_hash_splits=content_hash_splits,
-            allowed_overlap_pairs=allowed_overlap_pairs,
-            rows=pool_rows,
-            assignments=primary_assignments,
-            task=task,
-            seed=seed,
-        )
+        for assigned_split, count in stage_counts:
+            if assigned_split == "stage3_adapter_train":
+                pool_rows = _ordered_unique_task_pool(
+                    config,
+                    task=task,
+                    source_keys=training_source_keys,
+                    seed=seed,
+                    section_names=("sources",),
+                )
+            else:
+                pool_rows = _ordered_unique_pool(
+                    config,
+                    task=task,
+                    dataset_name=dataset_name,
+                    seed=seed,
+                    section_names=_stage_source_sections(
+                        config,
+                        task=task,
+                        dataset_name=dataset_name,
+                        stage=assigned_split,
+                    ),
+                )
+            pool_available_by_stage[assigned_split] = {
+                "count": len(pool_rows),
+                "official_splits": sorted({split for _, _, split, _, _ in pool_rows}),
+            }
+            _append_assignments(
+                entries=entries,
+                stable_id_splits=stable_id_splits,
+                content_hash_splits=content_hash_splits,
+                allowed_overlap_pairs=allowed_overlap_pairs,
+                rows=pool_rows,
+                assignments=((assigned_split, count),),
+                task=task,
+                seed=seed,
+            )
 
         evaluation_count = task_split_count(
             config,
             task=task,
             split_name="stage4_final_eval",
         )
+        pool_rows = _ordered_unique_pool(
+            config,
+            task=task,
+            dataset_name=dataset_name,
+            seed=seed,
+            section_names=("evaluation_sources",),
+        )
+        pool_available_by_stage["stage4_final_eval"] = {
+            "count": len(pool_rows),
+            "official_splits": sorted({split for _, _, split, _, _ in pool_rows}),
+        }
         _append_assignments(
             entries=entries,
             stable_id_splits=stable_id_splits,
@@ -290,12 +377,9 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
             seed=seed,
         )
         report["tasks"][task] = {
-            "pool_available": len(pool_rows),
-            "pool_official_splits": sorted(
-                {split for _, _, split, _, _ in pool_rows}
-            ),
+            "pool_available_by_stage": pool_available_by_stage,
             "selected": {
-                **dict(primary_assignments),
+                **dict(stage_counts),
                 "stage2_discovery": int(counts["stage2_discovery"][task]),
                 "stage2_discovery_by_source": discovery_sources[task],
                 "stage4_final_eval": evaluation_count,
@@ -313,6 +397,7 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
                 task=task,
                 dataset_name=str(source["dataset_name"]),
                 seed=seed,
+                section_names=("sources",),
             )
             count = int(requested_count)
             if len(rows) < count:

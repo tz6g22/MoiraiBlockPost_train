@@ -1,0 +1,28 @@
+seed: 42
+precision: bf16
+distributed: torchrun_fsdp_full_shard
+use_cache: false
+base_checkpoint: outputs/base/qwen3_14b_full_attnres
+data_manifest: outputs/data/splits.json
+data_config: configs/data.yaml
+partition_root: outputs/formal/discovery
+output_root: outputs/formal/adapter_lr3e-5
+trainable_parameters: pseudo_query_only
+micro_batch_size_per_gpu: 1
+gradient_accumulation_steps: 1
+optimizer: AdamW
+learning_rate: 3.0e-5
+betas: [0.9, 0.999]
+eps: 1.0e-8
+weight_decay: 0.0
+gradient_clip_norm: 1.0
+scheduler: cosine
+warmup_ratio: 0.02
+training_token_unit: nonpadding_input
+training_passes: 1
+checkpoint_interval_steps: 100
+progress_interval_steps: 100
+training_cases_per_task:
+  math: 1000
+  multihop: 1000
+  code: 200
