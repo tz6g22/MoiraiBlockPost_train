@@ -18,7 +18,14 @@ import certifi
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "600")
 
-from datasets import Dataset, DatasetDict, Features, Value, load_dataset
+from datasets import (
+    Dataset,
+    DatasetDict,
+    Features,
+    Value,
+    concatenate_datasets,
+    load_dataset,
+)
 from huggingface_hub import hf_hub_download
 
 from src.common import load_yaml
@@ -30,6 +37,17 @@ SOURCE_GROUPS = (
     "validation_sources",
     "probe_sources",
     "evaluation_sources",
+    "external_sources",
+)
+
+MATH_SUBSETS = (
+    "algebra",
+    "counting_and_probability",
+    "geometry",
+    "intermediate_algebra",
+    "number_theory",
+    "prealgebra",
+    "precalculus",
 )
 
 CLUTRR_FIELDS = (
@@ -87,6 +105,7 @@ def _required_fields(source: dict[str, Any]) -> list[str]:
             "context",
             "answer",
             "prompt",
+            "messages",
             "test_list",
             "test_setup_code",
             "challenge_test_list",
@@ -117,6 +136,14 @@ def _validate_local_source(source: dict[str, Any]) -> int:
             )
         if set(dataset.unique("official_split")) != {source["official_split"]}:
             raise RuntimeError("Local MBPP rows do not match their official split")
+    expected_columns = source.get("expected_columns")
+    if expected_columns is not None and set(dataset.column_names) != set(
+        expected_columns
+    ):
+        raise RuntimeError(
+            f"{source['dataset_name']} expected columns {sorted(expected_columns)}, "
+            f"got {dataset.column_names}"
+        )
     expected_rows = source.get("expected_rows")
     if expected_rows is not None and len(dataset) != int(expected_rows):
         raise RuntimeError(
@@ -190,6 +217,24 @@ def _download_clutrr(source: dict[str, Any]) -> DatasetDict:
     return DatasetDict(splits)
 
 
+def _download_math(source: dict[str, Any]) -> Dataset:
+    subsets = tuple(source.get("subsets", MATH_SUBSETS))
+    if subsets != MATH_SUBSETS:
+        raise ValueError(
+            "MATH source must include all seven Hendrycks MATH configurations"
+        )
+    datasets = [
+        load_dataset(
+            source["repo_id"],
+            subset,
+            split=source["official_split"],
+            revision=source["revision"],
+        )
+        for subset in subsets
+    ]
+    return concatenate_datasets(datasets)
+
+
 def _download_source(source: dict[str, Any]) -> int:
     destination = Path(source["local_path"])
     if destination.exists():
@@ -203,16 +248,27 @@ def _download_source(source: dict[str, Any]) -> int:
         dataset = _download_svamp(source)
     elif source["dataset_name"] == "clutrr":
         dataset = _download_clutrr(source)
+    elif source["dataset_name"] == "math":
+        dataset = _download_math(source)
     elif data_file:
-        local_file = hf_hub_download(
-            repo_id=source["repo_id"],
-            filename=data_file,
-            repo_type="dataset",
-            revision=source["revision"],
-        )
+        filenames = [data_file] if isinstance(data_file, str) else list(data_file)
+        if not filenames or not all(isinstance(filename, str) for filename in filenames):
+            raise ValueError("data_file must be a non-empty filename or filename list")
+        local_files = [
+            hf_hub_download(
+                repo_id=source["repo_id"],
+                filename=filename,
+                repo_type="dataset",
+                revision=source["revision"],
+            )
+            for filename in filenames
+        ]
+        file_format = source.get("file_format")
+        if file_format is None:
+            file_format = "json" if str(data_file).endswith((".json", ".jsonl")) else "parquet"
         dataset = load_dataset(
-            "parquet",
-            data_files={source["official_split"]: local_file},
+            file_format,
+            data_files={source["official_split"]: local_files},
             split=source["official_split"],
         )
     else:
@@ -259,7 +315,7 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
                 str(source["revision"]),
                 str(source["official_split"]),
                 str(source["local_path"]),
-                str(source.get("data_file", "")),
+                json.dumps(source.get("data_file", ""), ensure_ascii=False, sort_keys=True),
                 str(source.get("source_url", "")),
             )
             unique_sources[key] = source
@@ -269,13 +325,17 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
         row_count = _download_source(source)
         prepared.append(
             {
+                "dataset_name": source.get("dataset_name"),
                 "repo_id": key[0],
                 "subset": key[1],
                 "revision": key[2],
                 "split": key[3],
                 "local_path": key[4],
-                "data_file": key[5] or None,
+                "data_file": source.get("data_file"),
                 "source_url": key[6] or None,
+                "subsets": source.get("subsets"),
+                "source_reference": source.get("source_reference"),
+                "field_mapping": source.get("field_mapping"),
                 "rows": row_count,
             }
         )

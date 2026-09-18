@@ -8,10 +8,12 @@ import random
 import subprocess
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import yaml
@@ -20,18 +22,17 @@ from src.common import load_yaml, sha256_file, sha256_json
 from src.data.format_tasks import (
     PromptOnlyExample,
     TargetCausalExample,
+    collate_target_examples,
     format_task_target,
     nested_value,
 )
 from src.data.leakage_audit import audit_manifest
-from src.discovery.fixed_policy import resolve_fixed_num_blocks
 from src.discovery.ordinary_residual import (
     formal_discovery_status,
-    require_defined_residual_cost,
 )
 from src.formal.checkpoint import converted_config_sha256, load_joint_checkpoint, save_joint_checkpoint
 from src.formal.config import (
-    FORMAL_TASKS,
+    enabled_tasks,
     load_formal_config,
     resolve_base_model_path,
 )
@@ -42,14 +43,24 @@ from src.formal.data import (
     load_formal_records,
     load_record_row,
     records_by_task_and_stage,
+    validate_training_source_mixture,
     validate_formal_source_policy,
 )
 from src.formal.probe import load_formal_probe_head, train_formal_probe
-from src.formal.runtime import identity_test, parameter_hash, trainability_audit
+from src.formal.runtime import (
+    build_joint_optimizer,
+    identity_test,
+    parameter_hash,
+    trainability_audit,
+)
 from src.formal.task_banks import TaskBank
-from src.formal.train_joint import train_token_budget_mixture
+from src.formal.train_joint import FormalTokenScheduler, train_token_budget_sequential
 from src.evaluation.task_metrics import mean_metrics, task_score
 from src.modeling.partition import MoiraiPartition
+
+
+def _enabled_tasks(config: dict[str, Any]) -> tuple[str, ...]:
+    return enabled_tasks(config)
 
 
 def _path(raw: str) -> Path:
@@ -58,7 +69,91 @@ def _path(raw: str) -> Path:
 
 def _pipeline_paths(config: dict[str, Any]) -> dict[str, Path]:
     values = config["pipeline"]
-    return {key: _path(str(value)) for key, value in values.items() if key != "max_sequence_length"}
+    paths = {
+        key: _path(str(value))
+        for key, value in values.items()
+        if key != "max_sequence_length" and isinstance(value, str)
+    }
+    if "run_root" in paths:
+        paths["data_root"] = paths["run_root"] / "data"
+    return paths
+
+
+def _run_id(config: dict[str, Any]) -> str:
+    value = str(config["pipeline"].get("run_id", "")).strip()
+    if not value:
+        raise ValueError("Formal run_id is required for run-scoped artifacts")
+    return value
+
+
+def _discovery_partition_paths(config: dict[str, Any]) -> dict[str, Path]:
+    root = _pipeline_paths(config)["discovery_output"]
+    thresholds = config["discovery"]["similarity_thresholds"]
+    return {
+        str(task): root / str(task) / f"threshold_{format(float(value), 'g')}" / "partition.json"
+        for task, value in thresholds.items()
+    }
+
+
+def _validate_run_binding(config: dict[str, Any], data_hash: str) -> None:
+    paths = _pipeline_paths(config)
+    if "run_root" not in paths:
+        return
+    run_id = _run_id(config)
+    run_manifest_path = paths["run_root"] / "run_manifest.json"
+    if not run_manifest_path.is_file():
+        _stale_error("STALE_RUN_MISMATCH", f"run manifest is missing: {run_manifest_path}")
+    run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+    if run_manifest.get("run_id") != run_id:
+        _stale_error("STALE_RUN_MISMATCH", "run manifest run_id does not match config")
+    if run_manifest.get("config_sha256") != sha256_json(config):
+        _stale_error("STALE_RUN_MISMATCH", "run manifest config hash does not match config")
+    if run_manifest.get("data_manifest_sha256") != data_hash:
+        _stale_error("STALE_RUN_MISMATCH", "run manifest data hash does not match manifest")
+
+
+def _prepare_run_manifest(config: dict[str, Any]) -> dict[str, Any]:
+    """Create the isolated data manifest before any formal stage can consume it."""
+    paths = _pipeline_paths(config)
+    run_root = paths["run_root"]
+    if run_root.exists() and any(run_root.iterdir()):
+        _stale_error(
+            "STALE_RUN_MISMATCH",
+            f"formal run directory is non-empty; refusing implicit artifact reuse: {run_root}",
+            runtime=True,
+        )
+    from src.data.prepare_post_data import prepare
+
+    report = prepare(
+        paths["data_config"],
+        output_dir=paths["data_root"],
+        run_id=_run_id(config),
+    )
+    manifest_path = paths["data_manifest"]
+    data_hash = formal_data_manifest_sha256(manifest_path)
+    if report.get("status") != "PASS" or report.get("manifest_sha256") != data_hash:
+        _stale_error("STALE_RUN_MISMATCH", "generated data manifest report is invalid", runtime=True)
+    if report.get("run_id") != _run_id(config):
+        _stale_error("STALE_RUN_MISMATCH", "generated data manifest run_id mismatch", runtime=True)
+    run_root.mkdir(parents=True, exist_ok=True)
+    run_manifest = {
+        "run_id": _run_id(config),
+        "config_sha256": sha256_json(config),
+        "data_config_sha256": sha256_file(paths["data_config"]),
+        "data_manifest": str(manifest_path),
+        "data_manifest_sha256": data_hash,
+        "enabled_tasks": list(_enabled_tasks(config)),
+        "stage2_discovery_cases": _formal_discovery_counts(config),
+        "token_budget": config["data"]["token_budget"],
+        "status": "DATA_READY",
+    }
+    _write_json(run_root / "run_manifest.json", run_manifest)
+    return run_manifest
+
+
+def _stale_error(status: str, detail: str, *, runtime: bool = False) -> None:
+    error = RuntimeError if runtime else ValueError
+    raise error(f"{status}: {detail}")
 
 
 def _native_weight_hash(checkpoint: Path) -> str:
@@ -97,6 +192,81 @@ def _write_json(path: Path, payload: Any) -> None:
         dist.barrier()
 
 
+@torch.no_grad()
+def _validation_loss(
+    model,
+    banks: Mapping[str, TaskBank],
+    examples: Sequence[TargetCausalExample],
+    *,
+    task: str,
+    tokenizer,
+    device: torch.device,
+    distributed_context,
+) -> float:
+    banks[task].activate(model)
+    model.eval()
+    rank = distributed_context.rank if distributed_context is not None else 0
+    world_size = distributed_context.world_size if distributed_context is not None else 1
+    loss_sum = torch.zeros((), dtype=torch.float32, device=device)
+    token_count = torch.zeros((), dtype=torch.float32, device=device)
+    for index, example in enumerate(examples):
+        if index % world_size != rank:
+            continue
+        batch = collate_target_examples([example], pad_token_id=tokenizer.pad_token_id)
+        batch.pop("target_mask")
+        labels = batch.pop("labels").to(device)
+        inputs = {key: value.to(device) for key, value in batch.items()}
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            logits = model(**inputs, labels=labels, use_cache=False, logits_to_keep=0).logits
+        valid = labels != -100
+        if not valid.any():
+            continue
+        loss_sum += torch.nn.functional.cross_entropy(
+            logits.float().reshape(-1, logits.shape[-1]),
+            labels.reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+        )
+        token_count += valid.sum()
+    if distributed_context is not None and distributed_context.distributed:
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+    if token_count.item() <= 0:
+        raise RuntimeError("FORMAL_VALIDATION_HAS_NO_SUPERVISED_TOKENS")
+    value = loss_sum / token_count
+    if not torch.isfinite(value):
+        raise FloatingPointError("FORMAL_VALIDATION_LOSS_NAN_OR_INF")
+    banks[task].activate(model)
+    model.train()
+    return float(value.cpu())
+
+
+def _summarize_metric_file(path: Path, task: str) -> dict[str, Any]:
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ] if path.is_file() else []
+    if not rows:
+        raise RuntimeError(f"FORMAL_METRICS_EMPTY: {path}")
+    validation = [row for row in rows if row.get("val_loss") is not None]
+    total_tokens = sum(int(row["tokens_step"]) for row in rows)
+    total_seconds = sum(float(row.get("train_wall_seconds", 0.0)) for row in rows)
+    best_val = min((float(row["val_loss"]) for row in validation), default=None)
+    final_val = float(validation[-1]["val_loss"]) if validation else None
+    return {
+        "task": task,
+        "steps": len(rows),
+        "final_train_loss": float(rows[-1]["train_loss"]),
+        "best_val_loss": best_val,
+        "final_val_loss": final_val,
+        "best_val_ppl": float(np.exp(best_val)) if best_val is not None else None,
+        "final_val_ppl": float(np.exp(final_val)) if final_val is not None else None,
+        "average_tokens_per_second": total_tokens / total_seconds if total_seconds > 0 else 0.0,
+        "peak_memory_gb": max(float(row.get("peak_memory_gb", 0.0)) for row in rows),
+    }
+
+
 def _require_single_process(stage: str) -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size > 1:
@@ -132,6 +302,7 @@ def _launch_formal_stage(
     config_path: str,
     stage: str,
     max_steps: int | None = None,
+    resume: bool = False,
 ) -> dict[str, Any]:
     """Run one FSDP formal stage from a single coordinator process."""
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
@@ -160,6 +331,8 @@ def _launch_formal_stage(
     ]
     if max_steps is not None:
         command.extend(("--max-steps", str(max_steps)))
+    if resume:
+        command.append("--resume")
     subprocess.run(command, check=True)
     summary_path = {
         "train": paths["joint_checkpoint_output"].parent / "formal_training_summary.json",
@@ -175,8 +348,9 @@ def _data_context(config: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
     paths = _pipeline_paths(config)
     data_config = load_yaml(paths["data_config"])
     records = load_formal_records(paths["data_manifest"])
-    audit_formal_source_provenance(records, data_config=data_config)
-    validate_formal_source_policy(config, data_config)
+    tasks = _enabled_tasks(config)
+    audit_formal_source_provenance(records, data_config=data_config, enabled_tasks=tasks)
+    validate_formal_source_policy(config, data_config, enabled_tasks=tasks)
     allowed = data_config.get("allowed_cross_stage_reuse", ())
     leakage = audit_manifest(paths["data_manifest"], allowed_cross_stage_reuse=allowed)
     if leakage["status"] != "PASS":
@@ -188,21 +362,28 @@ def _data_context(config: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[st
         actual_hash = formal_data_manifest_sha256(paths["data_manifest"])
         if declared_hash is not None and declared_hash != actual_hash:
             raise RuntimeError("Formal data manifest report hash mismatch")
+        if "run_root" in paths and report.get("run_id") != _run_id(config):
+            raise RuntimeError("STALE_RUN_MISMATCH: data manifest report run_id mismatch")
+    _validate_run_binding(config, formal_data_manifest_sha256(paths["data_manifest"]))
     return records, data_config, formal_data_manifest_sha256(paths["data_manifest"]), leakage
 
 
-def _required_counts(data_config: dict[str, Any], stage: str) -> dict[str, int]:
+def _required_counts(
+    data_config: dict[str, Any],
+    stage: str,
+    tasks: tuple[str, ...],
+) -> dict[str, int]:
     from src.data.format_tasks import task_split_count
 
     return {
         task: task_split_count(data_config, task=task, split_name=stage)
-        for task in FORMAL_TASKS
+        for task in tasks
     }
 
 
 def _formal_discovery_counts(config: dict[str, Any]) -> dict[str, int]:
     values = config["discovery"]["cases"]
-    return {task: int(values[task]) for task in FORMAL_TASKS}
+    return {task: int(values[task]) for task in _enabled_tasks(config)}
 
 
 def _validate_data_for_stage(
@@ -214,45 +395,194 @@ def _validate_data_for_stage(
     expected = (
         _formal_discovery_counts(config)
         if stage == "stage2_discovery"
-        else _required_counts(data_config, stage)
+        else _required_counts(data_config, stage, _enabled_tasks(config))
     )
-    grouped = records_by_task_and_stage(records, stage=stage, expected_counts=expected)
+    grouped = records_by_task_and_stage(
+        records,
+        stage=stage,
+        expected_counts=expected,
+        enabled_tasks=_enabled_tasks(config),
+    )
+    if stage == "stage3_adapter_train" and config["discovery"].get("method") == "linear_cka_min":
+        validate_training_source_mixture(
+            grouped,
+            data_config=data_config,
+            enabled_tasks=_enabled_tasks(config),
+        )
     return records, data_config, data_hash, grouped, expected
 
 
 def _load_partitions(
     config: dict[str, Any],
     checkpoint: Path,
-) -> tuple[dict[str, MoiraiPartition], int, str]:
+    *,
+    expected_data_manifest_sha256: str | None = None,
+) -> tuple[dict[str, MoiraiPartition], str]:
+    discovery = config["discovery"]
+    if discovery.get("method") != "linear_cka_min":
+        _stale_error(
+            "STALE_PARTITION_MISMATCH",
+            "formal pipeline is not configured for Linear CKA min Discovery",
+        )
+    if discovery.get("metric") != "linear_cka":
+        _stale_error("STALE_PARTITION_MISMATCH", "formal Discovery metric is not linear_cka")
+    if discovery.get("interval_reduction") != "min":
+        _stale_error("STALE_PARTITION_MISMATCH", "formal CKA interval reduction is not min")
+    thresholds = discovery.get("similarity_thresholds", {})
+    if not isinstance(thresholds, dict):
+        raise ValueError("Formal CKA similarity_thresholds must be task-specific")
+    configured_paths = _discovery_partition_paths(config)
     native_config = _native_config(checkpoint)
     layers = int(native_config.num_hidden_layers)
     partition_config = config["discovery"]["partition"]
-    num_blocks = resolve_fixed_num_blocks(
-        layers,
-        fixed_block_size=int(partition_config["fixed_block_size"]),
-        policy=str(partition_config["num_blocks_policy"]),
-    )
     root = _pipeline_paths(config)["discovery_output"]
+    manifest_path = root / "linear_cka_manifest.json"
+    if not manifest_path.is_file():
+        _stale_error("STALE_PARTITION_MISMATCH", f"CKA manifest is missing: {manifest_path}")
+    discovery_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if discovery_manifest.get("metric") != "linear_cka_residual_v1":
+        _stale_error("STALE_PARTITION_MISMATCH", "CKA manifest metric mismatch")
+    if discovery_manifest.get("interval_reduction") != "min":
+        _stale_error("STALE_PARTITION_MISMATCH", "CKA manifest reduction mismatch")
+    if discovery_manifest.get("mode") != "ordinary_residual_only":
+        _stale_error("STALE_PARTITION_MISMATCH", "CKA manifest mode mismatch")
+    if discovery_manifest.get("run_id") != _run_id(config):
+        _stale_error("STALE_RUN_MISMATCH", "CKA manifest run_id mismatch")
+    if discovery_manifest.get("num_transformer_blocks") != layers:
+        _stale_error("MODEL_IDENTITY_MISMATCH", "CKA manifest layer count mismatch")
+    if set(discovery_manifest.get("tasks", ())) != set(_enabled_tasks(config)):
+        _stale_error("STALE_PARTITION_MISMATCH", "CKA manifest task set mismatch")
+    manifest_thresholds = discovery_manifest.get("similarity_thresholds_by_task", {})
+    if any(
+        manifest_thresholds.get(task) != [float(thresholds[task])]
+        for task in _enabled_tasks(config)
+    ):
+        _stale_error("STALE_PARTITION_MISMATCH", "CKA manifest threshold binding mismatch")
     partitions: dict[str, MoiraiPartition] = {}
     base_hash = _native_weight_hash(checkpoint)
-    for task in FORMAL_TASKS:
-        path = root / task / "partition.json"
+    for task in _enabled_tasks(config):
+        if task not in configured_paths:
+            raise ValueError(f"Formal CKA partition path is missing for task {task}")
+        if task not in thresholds:
+            raise ValueError(f"Formal CKA similarity threshold is missing for task {task}")
+        threshold = float(thresholds[task])
+        if not np.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError(f"Invalid formal CKA similarity threshold for {task}: {threshold}")
+        path = configured_paths[task]
         if not path.is_file():
-            raise FileNotFoundError(f"Formal Discovery partition is missing: {path}")
-        partition = MoiraiPartition.from_json(path)
-        if partition.task != task or len(partition.blocks) != num_blocks:
-            raise ValueError(f"Formal partition N mismatch for {task}")
-        if partition.num_transformer_blocks != layers:
-            raise ValueError(f"Formal partition depth mismatch for {task}")
-        if partition.min_block_length != int(partition_config["min_block_length"]):
-            raise ValueError(f"Formal partition minimum length mismatch for {task}")
-        if partition.max_block_length != int(partition_config["max_block_length"]):
-            raise ValueError(f"Formal partition maximum length mismatch for {task}")
+            _stale_error("STALE_PARTITION_MISMATCH", f"configured partition is missing: {path}")
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("discovery_checkpoint_sha256") != base_hash:
-            raise ValueError(f"Formal partition base checkpoint mismatch for {task}")
+        try:
+            partition = MoiraiPartition.from_dict(
+                {
+                    "task": payload["task"],
+                    "num_transformer_blocks": payload["num_transformer_blocks"],
+                    "blocks": [
+                        {
+                            key: block[key]
+                            for key in ("block_id", "start", "end", "length")
+                        }
+                        for block in payload["blocks"]
+                    ],
+                    "constraints": payload.get("constraints", {}),
+                }
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            _stale_error("STALE_PARTITION_MISMATCH", f"invalid CKA partition for {task}: {exc}")
+        if partition.task != task:
+            _stale_error("STALE_PARTITION_MISMATCH", f"task mismatch for {task}")
+        if partition.num_transformer_blocks != layers:
+            _stale_error("MODEL_IDENTITY_MISMATCH", f"partition depth mismatch for {task}")
+        if partition.min_block_length < int(partition_config["min_block_length"]):
+            _stale_error("STALE_PARTITION_MISMATCH", f"minimum length mismatch for {task}")
+        configured_max = partition_config.get("max_block_length")
+        if configured_max is not None and partition.max_block_length > int(configured_max):
+            _stale_error("STALE_PARTITION_MISMATCH", f"maximum length mismatch for {task}")
+        if payload.get("metric") != "linear_cka_residual_v1":
+            _stale_error("STALE_PARTITION_MISMATCH", f"partition metric mismatch for {task}")
+        if payload.get("interval_reduction") != "min":
+            _stale_error("STALE_PARTITION_MISMATCH", f"partition reduction mismatch for {task}")
+        if payload.get("task") != task:
+            _stale_error("STALE_PARTITION_MISMATCH", f"partition task mismatch for {task}")
+        if float(payload.get("similarity_threshold", float("nan"))) != threshold:
+            _stale_error("STALE_PARTITION_MISMATCH", f"partition threshold mismatch for {task}")
+        if payload.get("block_sizes") != list(partition.lengths):
+            _stale_error("STALE_PARTITION_MISMATCH", f"partition block-size payload mismatch for {task}")
+        if payload.get("partition_sha256") != partition.sha256:
+            _stale_error("STALE_PARTITION_MISMATCH", f"partition hash mismatch for {task}")
+        if payload.get("run_id") != _run_id(config):
+            _stale_error("STALE_RUN_MISMATCH", f"partition run_id mismatch for {task}")
+        if discovery_manifest.get("base_checkpoint_sha256") != base_hash:
+            _stale_error("MODEL_IDENTITY_MISMATCH", f"CKA base checkpoint mismatch for {task}")
+        if (
+            expected_data_manifest_sha256 is not None
+            and discovery_manifest.get("data_manifest_sha256") != expected_data_manifest_sha256
+        ):
+            _stale_error("STALE_PARTITION_MISMATCH", f"data manifest mismatch for {task}")
+
+        expected_cases = int(config["discovery"]["cases"][task])
+        statistics_path = path.parent.parent / "statistics.json"
+        if not statistics_path.is_file() and discovery_manifest.get("source_output_dir"):
+            statistics_path = Path(discovery_manifest["source_output_dir"]) / task / "statistics.json"
+        if not statistics_path.is_file():
+            _stale_error("STALE_PARTITION_MISMATCH", f"CKA statistics are missing: {statistics_path}")
+        statistics = json.loads(statistics_path.read_text(encoding="utf-8"))
+        if statistics.get("metric") != "linear_cka_residual_v1":
+            _stale_error("STALE_PARTITION_MISMATCH", f"CKA statistics mismatch for {task}")
+        if int(statistics.get("case_count", -1)) != expected_cases:
+            _stale_error("STALE_PARTITION_MISMATCH", f"Discovery case count mismatch for {task}")
+
+        similarity_path = path.parent.parent / "similarity_matrix.npy"
+        interval_path = path.parent.parent / "interval_similarity_matrix.npy"
+        if not similarity_path.is_file() or not interval_path.is_file():
+            _stale_error("STALE_PARTITION_MISMATCH", f"CKA matrices are missing for {task}")
+        matrix_hashes = discovery_manifest.get("similarity_matrix_sha256") or discovery_manifest.get(
+            "source_similarity_matrix_sha256", {}
+        )
+        if matrix_hashes.get(task) != sha256_file(similarity_path):
+            _stale_error("STALE_PARTITION_MISMATCH", f"CKA similarity matrix hash mismatch for {task}")
+        if payload.get("similarity_matrix_sha256") != sha256_file(similarity_path):
+            _stale_error("STALE_PARTITION_MISMATCH", f"partition matrix hash mismatch for {task}")
+        if payload.get("base_checkpoint_sha256") != base_hash:
+            _stale_error("MODEL_IDENTITY_MISMATCH", f"partition base checkpoint mismatch for {task}")
+        if (
+            expected_data_manifest_sha256 is not None
+            and payload.get("data_manifest_sha256") != expected_data_manifest_sha256
+        ):
+            _stale_error("STALE_PARTITION_MISMATCH", f"partition data manifest mismatch for {task}")
+        similarity = np.load(similarity_path, allow_pickle=False)
+        interval_similarity = np.load(interval_path, allow_pickle=False)
+        if (
+            similarity.shape != (layers, layers)
+            or not np.isfinite(similarity).all()
+            or not np.allclose(similarity, similarity.T, rtol=0.0, atol=1.0e-6)
+            or not np.allclose(np.diag(similarity), 1.0, rtol=0.0, atol=1.0e-6)
+        ):
+            _stale_error("MODEL_IDENTITY_MISMATCH", f"CKA similarity matrix is invalid for {task}")
+        if interval_similarity.shape != (layers, layers):
+            _stale_error("MODEL_IDENTITY_MISMATCH", f"CKA interval matrix shape mismatch for {task}")
+        for start in range(layers):
+            if not np.isfinite(interval_similarity[start, start]):
+                _stale_error("MODEL_IDENTITY_MISMATCH", f"CKA singleton score is invalid for {task}")
+            for end in range(start + 1, layers):
+                if not np.isfinite(interval_similarity[start, end]):
+                    _stale_error("MODEL_IDENTITY_MISMATCH", f"CKA interval score is invalid for {task}")
+        if int(payload.get("num_transformer_blocks", -1)) != layers:
+            _stale_error("MODEL_IDENTITY_MISMATCH", f"partition layer count mismatch for {task}")
+        cursor = 0
+        for block in partition.blocks:
+            if block.start != cursor or block.end >= layers:
+                _stale_error("STALE_PARTITION_MISMATCH", f"partition coverage mismatch for {task}")
+            if block.length > 1 and interval_similarity[block.start, block.end] + 1.0e-12 < threshold:
+                _stale_error(
+                    "STALE_PARTITION_MISMATCH",
+                    f"block similarity below threshold for {task}: [{block.start},{block.end}]={interval_similarity[block.start, block.end]}",
+                )
+            cursor = block.end + 1
+        if cursor != layers:
+            _stale_error("STALE_PARTITION_MISMATCH", f"partition does not cover all layers for {task}")
         partitions[task] = partition
-    return partitions, num_blocks, base_hash
+    return partitions, base_hash
 
 
 def _build_task_banks(
@@ -260,7 +590,7 @@ def _build_task_banks(
     partitions: dict[str, MoiraiPartition],
 ) -> dict[str, TaskBank]:
     banks: dict[str, TaskBank] = {}
-    for task in FORMAL_TASKS:
+    for task in partitions:
         partition = partitions[task]
         model.config.moirai_partition = list(partition.lengths)
         model.config.moirai_task = task
@@ -268,7 +598,7 @@ def _build_task_banks(
         bank = TaskBank.from_model(model, task=task, partition_sha256=partition.sha256)
         bank.partition_lengths = partition.lengths
         banks[task] = bank
-    banks["math"].activate(model)
+    banks[next(iter(banks))].activate(model)
     return banks
 
 
@@ -287,13 +617,15 @@ def _load_formal_runtime(
 ):
     from src.formal.conversion import convert_qwen3_checkpoint
 
+    initial_task = next(iter(partitions))
+    initial_partition = partitions[initial_task]
     original, formal = convert_qwen3_checkpoint(
         checkpoint,
-        partition=list(partitions["math"].lengths),
-        task="math",
-        min_block_length=partitions["math"].min_block_length,
-        max_block_length=partitions["math"].max_block_length,
-        no_adjacent_singletons=partitions["math"].no_adjacent_singletons,
+        partition=list(initial_partition.lengths),
+        task=initial_task,
+        min_block_length=initial_partition.min_block_length,
+        max_block_length=initial_partition.max_block_length,
+        no_adjacent_singletons=initial_partition.no_adjacent_singletons,
         dtype=torch.bfloat16,
     )
     banks = _build_task_banks(formal, partitions)
@@ -302,30 +634,31 @@ def _load_formal_runtime(
         distributed_context is None or distributed_context.is_rank0
     )
     if run_identity:
+        tasks = (
+            _enabled_tasks(config)
+            if config.get("tasks", {}).get("enabled")
+            else tuple(partitions)
+        )
         if isinstance(identity_examples, Mapping):
             examples_by_task = {
                 task: tuple(identity_examples.get(task, ()))
-                for task in FORMAL_TASKS
+                for task in tasks
             }
         else:
-            examples_by_task = {
-                "math": tuple(identity_examples),
-                "multihop": (),
-                "code": (),
-            }
-        if any(not examples_by_task[task] for task in FORMAL_TASKS):
+            examples_by_task = {task: tuple(identity_examples) if index == 0 else () for index, task in enumerate(tasks)}
+        if any(not examples_by_task[task] for task in tasks):
             raise RuntimeError(
                 "FORMAL_IDENTITY_TEST_MISSING: one identity example is required "
                 "for each formal task partition"
             )
         if distributed_context is not None and distributed_context.distributed:
-            # A 14B CPU forward is unnecessarily slow on the coordinator node.
+            # A large CPU forward is unnecessarily slow on the coordinator node.
             # Rank 0 owns the validation work and can use its assigned GPU;
             # return both models to CPU before FSDP wraps the formal model.
             original.to(device)
             formal.to(device)
         per_task_identity: dict[str, dict[str, Any]] = {}
-        for task in FORMAL_TASKS:
+        for task in tasks:
             banks[task].activate(formal)
             example = examples_by_task[task][0]
             ids = example.input_ids.unsqueeze(0)
@@ -339,7 +672,7 @@ def _load_formal_runtime(
                     f"IDENTITY_CONVERSION_FAILED for formal task {task}"
                 )
             per_task_identity[task] = task_identity
-        banks["math"].activate(formal)
+        banks[next(iter(banks))].activate(formal)
         identity = {
             "status": "PASS",
             "max_abs_logit_diff": max(
@@ -381,7 +714,7 @@ def _load_formal_runtime(
             load_checkpoint_dir,
             model=formal,
             banks=banks,
-            active_task="math",
+            active_task=next(iter(banks)),
             restore_rng=False,
             expected_base_checkpoint_sha256=expected_base_checkpoint_sha256,
             expected_data_manifest_sha256=expected_data_manifest_sha256,
@@ -405,11 +738,13 @@ def _load_formal_runtime(
 
 
 def _run_formal_discovery(config: dict[str, Any], checkpoint: Path) -> dict[str, Any]:
-    records, data_config, _, grouped, _ = _validate_data_for_stage(
+    records, data_config, data_hash, grouped, _ = _validate_data_for_stage(
         config, stage="stage2_discovery"
     )
     del records, data_config, grouped
-    require_defined_residual_cost(config["discovery"])
+    discovery = config["discovery"]
+    if discovery.get("method") != "linear_cka_min":
+        raise RuntimeError("STALE_PARTITION_MISMATCH: formal Discovery must use linear_cka_min")
     paths = _pipeline_paths(config)
     worker_count = int(config["distributed"]["discovery_processes_per_node"])
     master_port = int(os.environ.get(
@@ -420,19 +755,23 @@ def _run_formal_discovery(config: dict[str, Any], checkpoint: Path) -> dict[str,
         raise ValueError("QWEN3_DISCOVERY_MASTER_PORT must be in [1024, 65535]")
     runtime_config = {
         "seed": int(config["experiment"]["seed"]),
+        "run_id": _run_id(config),
         "model_mode": "original_residual_only",
         "formal_discovery": True,
-        "ordinary_residual_cost_defined": True,
+        "ordinary_residual_only": True,
+        "discovery_metric": "linear_cka",
+        "cka_interval_reduction": "min",
         "base_checkpoint": str(checkpoint),
         "data_manifest": str(paths["data_manifest"]),
         "data_config": str(paths["data_config"]),
-        "tasks": list(FORMAL_TASKS),
+        "tasks": list(_enabled_tasks(config)),
         "discovery_cases_per_task": _formal_discovery_counts(config),
-        "fixed_block_size": int(config["discovery"]["partition"]["fixed_block_size"]),
-        "num_blocks_policy": str(config["discovery"]["partition"]["num_blocks_policy"]),
+        "task_similarity_thresholds": {
+            task: float(discovery["similarity_thresholds"][task])
+            for task in _enabled_tasks(config)
+        },
         "min_block_length": int(config["discovery"]["partition"]["min_block_length"]),
-        "max_block_length": int(config["discovery"]["partition"]["max_block_length"]),
-        "no_adjacent_singletons": bool(config["discovery"]["partition"]["no_adjacent_singletons"]),
+        "max_block_length": config["discovery"]["partition"].get("max_block_length"),
         "discovery_processes_per_node": worker_count,
         "discovery_master_port": master_port,
         "output_dir": str(paths["discovery_output"]),
@@ -467,22 +806,37 @@ def _run_formal_discovery(config: dict[str, Any], checkpoint: Path) -> dict[str,
         str(paths["data_manifest"]),
         "--output-dir",
         str(paths["discovery_output"]),
-        "--resume",
-        str(paths["discovery_output"]),
     ]
     subprocess.run(command, check=True)
-    partitions, num_blocks, base_hash = _load_partitions(config, checkpoint)
+    partitions, base_hash = _load_partitions(
+        config, checkpoint, expected_data_manifest_sha256=data_hash
+    )
+    run_manifest_path = paths["run_root"] / "run_manifest.json"
+    run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+    cka_manifest_path = paths["discovery_output"] / "linear_cka_manifest.json"
+    cka_manifest = json.loads(cka_manifest_path.read_text(encoding="utf-8"))
+    run_manifest["discovery"] = {
+        "method": "linear_cka_min",
+        "manifest": str(cka_manifest_path),
+        "manifest_sha256": sha256_file(cka_manifest_path),
+        "similarity_matrix_sha256": cka_manifest["similarity_matrix_sha256"],
+        "partition_sha256": {
+            task: partitions[task].sha256 for task in _enabled_tasks(config)
+        },
+        "status": "PASS",
+    }
+    _write_json(run_manifest_path, run_manifest)
     result = {
         "status": "PASS",
         "base_checkpoint_sha256": base_hash,
         "num_transformer_blocks": int(_native_config(checkpoint).num_hidden_layers),
-        "num_moirai_blocks": num_blocks,
         "tasks": {
             task: {
                 "lengths": list(partitions[task].lengths),
+                "num_moirai_blocks": len(partitions[task].blocks),
                 "partition_sha256": partitions[task].sha256,
             }
-            for task in FORMAL_TASKS
+            for task in _enabled_tasks(config)
         },
     }
     _write_json(paths["discovery_output"] / "formal_pipeline_discovery_summary.json", result)
@@ -494,15 +848,22 @@ def _run_train(
     checkpoint: Path,
     *,
     max_steps: int | None = None,
+    resume: bool = False,
 ) -> dict[str, Any]:
     _, data_config, data_hash, grouped, expected = _validate_data_for_stage(
         config, stage="stage3_adapter_train"
     )
-    partitions, _, base_hash = _load_partitions(config, checkpoint)
+    _, _, _, validation_grouped, _ = _validate_data_for_stage(
+        config, stage="stage3_adapter_val"
+    )
+    partitions, base_hash = _load_partitions(
+        config, checkpoint, expected_data_manifest_sha256=data_hash
+    )
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True, use_fast=True)
     max_length = int(config["pipeline"]["max_sequence_length"])
+    task_order = tuple(config["training"]["task_order"])
     examples = build_formal_examples(
         grouped,
         data_config=data_config,
@@ -510,6 +871,58 @@ def _run_train(
         target=True,
         max_length=max_length,
     )
+    validation_examples = build_formal_examples(
+        validation_grouped,
+        data_config=data_config,
+        tokenizer=tokenizer,
+        target=True,
+        max_length=max_length,
+    )
+    source_registry = {
+        key: source
+        for section in ("sources", "external_sources")
+        for key, source in data_config.get(section, {}).items()
+    }
+    source_examples = {task: {} for task in task_order}
+    for task in task_order:
+        for record, example in zip(grouped[task], examples[task]):
+            source_examples[task].setdefault(str(record["dataset"]), []).append(example)
+    source_weights = {
+        task: {
+            str(source_registry[key]["dataset_name"]): float(weight)
+            for key, weight in data_config["training_source_weights"][task].items()
+        }
+        for task in task_order
+    }
+    token_budgets = {
+        task: int(config["data"]["token_budget"][task])
+        for task in task_order
+    }
+    paths = _pipeline_paths(config)
+    joint_dir = paths["joint_checkpoint_output"]
+    manifest_path = joint_dir / "checkpoint_manifest.json"
+    if resume and not manifest_path.is_file():
+        _stale_error(
+            "STALE_CHECKPOINT_MISMATCH",
+            f"requested resume checkpoint is missing: {manifest_path}",
+            runtime=True,
+        )
+    if not resume and joint_dir.exists() and any(joint_dir.iterdir()):
+        _stale_error(
+            "STALE_CHECKPOINT_MISMATCH",
+            "existing formal checkpoint output requires explicit --resume; refusing to overwrite",
+            runtime=True,
+        )
+    if not resume and any(
+        (joint_dir.parent / f"metrics_{task}.jsonl").is_file()
+        for task in task_order
+    ):
+        _stale_error(
+            "STALE_CHECKPOINT_MISMATCH",
+            "existing formal metrics require explicit --resume; refusing to overwrite training history",
+            runtime=True,
+        )
+
     device = _device()
     distributed_context = None
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
@@ -526,7 +939,6 @@ def _run_train(
         distributed_context=distributed_context,
     )
     del original
-    paths = _pipeline_paths(config)
     if identity is None:
         raise RuntimeError("FORMAL_IDENTITY_TEST_MISSING")
     identity_record = {
@@ -535,6 +947,75 @@ def _run_train(
         "converted_config_sha256": converted_config_sha256(model),
     }
     _write_json(paths["joint_checkpoint_output"].parent / "identity_test.json", identity_record)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+    optimizer = build_joint_optimizer(
+        model,
+        backbone_lr=float(config["training"]["optimizer"]["parameter_groups"]["backbone"]["lr"]),
+        attnres_lr=float(config["training"]["optimizer"]["parameter_groups"]["attnres"]["lr"]),
+        backbone_weight_decay=float(config["training"]["optimizer"]["parameter_groups"]["backbone"]["weight_decay"]),
+        attnres_weight_decay=float(config["training"]["optimizer"]["parameter_groups"]["attnres"]["weight_decay"]),
+        query_lr=(
+            float(config["training"]["optimizer"]["parameter_groups"]["query"]["lr"])
+            if "query" in config["training"]["optimizer"]["parameter_groups"]
+            else None
+        ),
+        alpha_lr=(
+            float(config["training"]["optimizer"]["parameter_groups"]["alpha"]["lr"])
+            if "alpha" in config["training"]["optimizer"]["parameter_groups"]
+            else None
+        ),
+        betas=tuple(config["training"]["optimizer"]["betas"]),
+        eps=float(config["training"]["optimizer"]["eps"]),
+    )
+    scheduler = FormalTokenScheduler(
+        optimizer,
+        maximum_tokens=sum(token_budgets.values()),
+        warmup_ratio=float(config["training"]["scheduler"]["warmup_ratio"]),
+        min_lr_ratio=float(config["training"]["scheduler"]["min_lr_ratio"]),
+    )
+    initial_progress: dict[str, Any] = {}
+    if resume:
+        resume_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        resume_progress = resume_payload.get("training_progress", {})
+        resume_task = resume_progress.get("current_task") or task_order[0]
+        if resume_task not in task_order:
+            raise ValueError("Formal resume checkpoint has an unknown current task")
+        resume_manifest = load_joint_checkpoint(
+            joint_dir,
+            model=model,
+            banks=banks,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            active_task=resume_task,
+            restore_rng=True,
+            expected_base_checkpoint_sha256=base_hash,
+            expected_data_manifest_sha256=data_hash,
+            expected_config_sha256=sha256_json(config),
+        )
+        initial_progress = dict(resume_manifest.get("training_progress", {}))
+        if tuple(initial_progress.get("task_order", ())) != task_order:
+            _stale_error("TASK_ORDER_MISMATCH", "formal resume task order does not match config")
+        if initial_progress.get("mode") != "sequential_task_training":
+            _stale_error("TRAINING_MODE_MISMATCH", "formal resume checkpoint is not sequential training state")
+        expected_metric_files = {
+            task: str(paths["joint_checkpoint_output"].parent / f"metrics_{task}.jsonl")
+            for task in task_order
+        }
+        expected_metric_files["combined"] = str(
+            paths["joint_checkpoint_output"].parent / "metrics.jsonl"
+        )
+        if resume_manifest.get("metrics_files") != expected_metric_files:
+            raise ValueError("Formal resume metrics files do not match the current pipeline")
+
+    task_bank_updates = {
+        task: {
+            "query": bool(initial_progress.get("task_bank_updates", {}).get(task, {}).get("query", False)),
+            "alpha": bool(initial_progress.get("task_bank_updates", {}).get(task, {}).get("alpha", False)),
+        }
+        for task in task_order
+    }
+
     train_audit = trainability_audit(model)
     backbone_names = train_audit["backbone"]
     query_names = train_audit["query"]
@@ -549,23 +1030,224 @@ def _run_train(
             "query": banks[task].state_hash("pseudo_query"),
             "alpha": banks[task].state_hash("alpha"),
         }
-        for task in FORMAL_TASKS
+        for task in _enabled_tasks(config)
     }
-    partition_hashes_before = {task: partitions[task].sha256 for task in FORMAL_TASKS}
-    optimizer, scheduler, consumed, results = train_token_budget_mixture(
+    partition_hashes_before = {task: partitions[task].sha256 for task in task_order}
+    metric_paths = {
+        task: paths["joint_checkpoint_output"].parent / f"metrics_{task}.jsonl"
+        for task in task_order
+    }
+    unified_metrics_path = paths["joint_checkpoint_output"].parent / "metrics.jsonl"
+    metrics_summary_path = paths["joint_checkpoint_output"].parent / "metrics_summary.json"
+    window_size = int(config["training"]["metrics"]["window_size"])
+    loss_windows = {task: deque(maxlen=window_size) for task in task_order}
+    if resume:
+        for task, path in metric_paths.items():
+            if path.is_file():
+                for line in path.read_text(encoding="utf-8").splitlines()[-window_size:]:
+                    if line.strip():
+                        loss_windows[task].append(float(json.loads(line)["loss"]))
+    last_loss_per_task: dict[str, float | None] = {task: None for task in task_order}
+    stage_peak_memory_bytes = {
+        task: int(initial_progress.get("stage_peak_memory_bytes", {}).get(task, 0))
+        for task in task_order
+    }
+    current_stage_peak_memory_bytes = int(
+        initial_progress.get("current_stage_peak_memory_bytes", 0)
+    )
+
+    def write_metric(record: dict[str, Any]) -> None:
+        nonlocal current_stage_peak_memory_bytes
+        task = str(record["task"])
+        task_bank_updates[task]["query"] |= float(record.get("query_parameter_delta", 0.0)) > 0.0
+        task_bank_updates[task]["alpha"] |= float(record.get("alpha_parameter_delta", 0.0)) > 0.0
+        loss_windows[task].append(float(record["loss"]))
+        task_cumulative_tokens = record.get("task_cumulative_tokens") or {}
+        tokens_step = int(
+            record.get("non_padding_tokens_this_step", record.get("tokens_step", 0))
+        )
+        task_tokens = int(task_cumulative_tokens.get(task, record.get("task_tokens", 0)))
+        global_tokens = int(
+            record.get("global_cumulative_tokens", record.get("global_tokens", 0))
+        )
+        train_wall_seconds = float(record.get("train_wall_seconds", 0.0))
+        if torch.cuda.is_available():
+            current_stage_peak_memory_bytes = max(
+                current_stage_peak_memory_bytes,
+                int(torch.cuda.max_memory_allocated(device)),
+            )
+        validation_interval = int(
+            config["training"]["metrics"]["validation_interval_steps"]
+        )
+        val_loss = None
+        if int(record["global_step"]) % validation_interval == 0:
+            val_loss = _validation_loss(
+                model,
+                banks,
+                validation_examples[task][: int(config["training"]["metrics"]["validation_examples_per_task"])],
+                task=task,
+                tokenizer=tokenizer,
+                device=device,
+                distributed_context=distributed_context,
+            )
+        peak_bytes = torch.tensor(
+            current_stage_peak_memory_bytes,
+            dtype=torch.int64,
+            device=device,
+        )
+        if distributed_context is not None and distributed_context.distributed:
+            dist.all_reduce(peak_bytes, op=dist.ReduceOp.MAX)
+            current_stage_peak_memory_bytes = int(peak_bytes.item())
+        peak_memory_gb = current_stage_peak_memory_bytes / (1024 ** 3)
+        record = {
+            **record,
+            "raw_loss": float(record["loss"]),
+            "method": "task_adaptive_block_attnres",
+            "stage": task,
+            "tokens_seen": global_tokens,
+            "train_loss": float(record["loss"]),
+            "val_loss": val_loss,
+            "val_ppl": float(np.exp(val_loss)) if val_loss is not None else None,
+            "smoothed_loss": sum(loss_windows[task]) / len(loss_windows[task]),
+            "tokens_step": tokens_step,
+            "task_tokens": task_tokens,
+            "global_tokens": global_tokens,
+            "tokens_per_second": tokens_step / max(train_wall_seconds, 1.0e-9),
+            "train_wall_seconds": train_wall_seconds,
+            "peak_memory_gb": peak_memory_gb,
+        }
+        last_loss_per_task[task] = float(record["loss"])
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+        with metric_paths[task].open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        with unified_metrics_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def save_progress(progress, active_optimizer, active_scheduler) -> None:
+        nonlocal current_stage_peak_memory_bytes
+        completed_task = (
+            progress["completed_tasks"][-1]
+            if progress.get("completed_tasks")
+            else None
+        )
+        if completed_task is not None:
+            stage_peak_memory_bytes[completed_task] = max(
+                stage_peak_memory_bytes.get(completed_task, 0),
+                current_stage_peak_memory_bytes,
+            )
+            current_stage_peak_memory_bytes = 0
+        progress = {
+            **progress,
+            "task_bank_updates": task_bank_updates,
+            "stage_peak_memory_bytes": stage_peak_memory_bytes,
+            "current_stage_peak_memory_bytes": current_stage_peak_memory_bytes,
+        }
+        metrics_files = {task: str(metric_paths[task]) for task in task_order}
+        metrics_files["combined"] = str(unified_metrics_path)
+        save_joint_checkpoint(
+            joint_dir,
+            model=model,
+            banks=banks,
+            partitions={task: partitions[task].to_dict() for task in task_order},
+            optimizer=active_optimizer,
+            scheduler=active_scheduler,
+            config=config,
+            base_checkpoint_sha256=base_hash,
+            data_manifest_sha256=data_hash,
+            consumed_tokens=progress["task_cumulative_tokens"],
+            seed=int(config["experiment"]["seed"]),
+            identity_test=identity_record,
+            training_progress=progress,
+            metrics_files=metrics_files,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
+
+    optimizer, scheduler, consumed, results, progress = train_token_budget_sequential(
         model,
         banks=banks,
         examples_by_task=examples,
+        source_examples_by_task=source_examples,
+        source_weights_by_task=source_weights,
         tokenizer=tokenizer,
         training_config=config["training"],
-        token_budgets={task: int(config["data"]["token_budget"][task]) for task in FORMAL_TASKS},
+        token_budgets=token_budgets,
+        task_order=task_order,
         device=device,
         max_steps=max_steps,
         distributed_context=distributed_context,
         seed=int(config["experiment"]["seed"]),
         shuffle=bool(config["data"]["shuffle"]),
+        optimizer=optimizer,
+        scheduler=scheduler,
+        initial_progress=initial_progress,
+        on_step=write_metric,
+        on_task_boundary=save_progress,
     )
-    complete = all(consumed[task] >= int(config["data"]["token_budget"][task]) for task in FORMAL_TASKS)
+    current_task = progress.get("current_task")
+    if current_task in task_order:
+        stage_peak_memory_bytes[current_task] = max(
+            stage_peak_memory_bytes.get(current_task, 0),
+            current_stage_peak_memory_bytes,
+        )
+    progress = {
+        **progress,
+        "task_bank_updates": task_bank_updates,
+        "stage_peak_memory_bytes": stage_peak_memory_bytes,
+        "current_stage_peak_memory_bytes": current_stage_peak_memory_bytes,
+    }
+    if torch.cuda.is_available():
+        from src.distributed.fsdp_utils import DistributedContext, peak_memory_stats
+
+        memory_context = distributed_context or DistributedContext(
+            rank=0,
+            local_rank=int(device.index or 0),
+            world_size=1,
+            device=device,
+        )
+        peak_memory_rows = peak_memory_stats(memory_context)
+        peak_memory = {
+            "scope": "formal_training_after_identity",
+            "per_rank": peak_memory_rows,
+            "peak_allocated_bytes": max(
+                row["peak_allocated_bytes"] for row in peak_memory_rows or []
+            ),
+            "peak_reserved_bytes": max(
+                row["peak_reserved_bytes"] for row in peak_memory_rows or []
+            ),
+        } if peak_memory_rows is not None else None
+    else:
+        peak_memory = None
+    complete = all(consumed[task] >= token_budgets[task] for task in task_order)
+    metric_summaries = (
+        {
+            task: _summarize_metric_file(metric_paths[task], task)
+            for task in task_order
+            if metric_paths[task].is_file()
+        }
+        if not dist.is_initialized() or dist.get_rank() == 0
+        else {}
+    )
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        metrics_summary_path.write_text(
+            json.dumps(
+                {
+                    "method": "task_adaptive_block_attnres",
+                    "math": metric_summaries.get("math"),
+                    "multihop": metric_summaries.get("multihop"),
+                    "overall": {
+                        "total_tokens": int(sum(consumed.values())),
+                        "total_walltime": float(progress.get("global_training_wall_seconds", 0.0)),
+                        "max_peak_memory_gb": max(stage_peak_memory_bytes.values(), default=0) / (1024 ** 3),
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     after_backbone_hash = parameter_hash(
         model,
         backbone_names,
@@ -576,34 +1258,45 @@ def _run_train(
             "query": banks[task].state_hash("pseudo_query"),
             "alpha": banks[task].state_hash("alpha"),
         }
-        for task in FORMAL_TASKS
+        for task in _enabled_tasks(config)
     }
-    partition_hashes_after = {task: partitions[task].sha256 for task in FORMAL_TASKS}
+    partition_hashes_after = {task: partitions[task].sha256 for task in _enabled_tasks(config)}
     changed = {
         task: {
-            "query": before_bank_hashes[task]["query"] != after_bank_hashes[task]["query"],
-            "alpha": before_bank_hashes[task]["alpha"] != after_bank_hashes[task]["alpha"],
+            "query": task_bank_updates[task]["query"]
+            or before_bank_hashes[task]["query"] != after_bank_hashes[task]["query"],
+            "alpha": task_bank_updates[task]["alpha"]
+            or before_bank_hashes[task]["alpha"] != after_bank_hashes[task]["alpha"],
         }
-        for task in FORMAL_TASKS
+        for task in task_order
     }
     if partition_hashes_after != partition_hashes_before:
         raise RuntimeError("PARTITION_CHANGED_IN_FORMAL_TRAINING_SUMMARY")
     if complete and before_backbone_hash == after_backbone_hash:
         raise RuntimeError("FORMAL_BACKBONE_DID_NOT_UPDATE")
-    if complete and not all(changed[task]["query"] for task in FORMAL_TASKS):
+    if complete and not all(changed[task]["query"] for task in task_order):
         raise RuntimeError("FORMAL_TASK_QUERY_DID_NOT_UPDATE")
-    if complete and not all(changed[task]["alpha"] for task in FORMAL_TASKS):
+    if complete and not all(changed[task]["alpha"] for task in task_order):
         raise RuntimeError("FORMAL_TASK_ALPHA_DID_NOT_UPDATE")
     summary = {
         "status": "PASS" if complete else "PARTIAL_CONNECTIVITY",
+        "training_mode": "sequential_task_training",
+        "task_order": list(task_order),
         "identity": identity_record,
         "requested_record_counts": expected,
         "consumed_tokens_per_task": consumed,
         "steps": len(results),
         "last_loss": results[-1].loss if results else None,
+        "last_loss_per_task": last_loss_per_task,
         "backbone_grad_norm_last": results[-1].backbone_grad_norm if results else None,
         "query_grad_norm_last": results[-1].query_grad_norm if results else None,
         "alpha_grad_norm_last": results[-1].alpha_grad_norm if results else None,
+        "query_parameter_delta_last": results[-1].query_parameter_delta if results else None,
+        "alpha_parameter_delta_last": results[-1].alpha_parameter_delta if results else None,
+        "query_optimizer_membership": all(
+            result.query_optimizer_membership for result in results
+        ),
+        "query_dtype": results[-1].query_dtype if results else None,
         "trainability": {
             "backbone_parameter_count": len(backbone_names),
             "query_parameter_count": len(query_names),
@@ -618,16 +1311,23 @@ def _run_train(
         "partition_hashes_after": partition_hashes_after,
         "base_checkpoint_sha256": base_hash,
         "data_manifest_sha256": data_hash,
-        "partitions": {task: partitions[task].to_dict() for task in FORMAL_TASKS},
+        "partitions": {task: partitions[task].to_dict() for task in task_order},
+        "training_progress": progress,
+        "metrics_files": {
+            **{task: str(metric_paths[task]) for task in task_order},
+            "combined": str(unified_metrics_path),
+        },
+        "peak_memory": peak_memory,
+        "metrics_summary": metric_summaries,
+        "metrics_path": str(unified_metrics_path),
+        "stage_peak_memory_bytes": stage_peak_memory_bytes,
     }
     _write_json(paths["joint_checkpoint_output"].parent / "formal_training_summary.json", summary)
-    if not complete:
-        return summary
     manifest = save_joint_checkpoint(
         paths["joint_checkpoint_output"],
         model=model,
         banks=banks,
-        partitions={task: partitions[task].to_dict() for task in FORMAL_TASKS},
+        partitions={task: partitions[task].to_dict() for task in task_order},
         optimizer=optimizer,
         scheduler=scheduler,
         config=config,
@@ -636,6 +1336,11 @@ def _run_train(
         consumed_tokens=consumed,
         seed=int(config["experiment"]["seed"]),
         identity_test=identity_record,
+        training_progress=progress,
+        metrics_files={
+            **{task: str(metric_paths[task]) for task in task_order},
+            "combined": str(unified_metrics_path),
+        },
     )
     summary["checkpoint_manifest_sha256"] = sha256_file(
         paths["joint_checkpoint_output"] / "checkpoint_manifest.json"
@@ -648,11 +1353,18 @@ def _run_train(
 def _probe_data(config: dict[str, Any], tokenizer, data_config, records):
     from src.formal.data import records_by_task_and_stage
 
+    tasks = _enabled_tasks(config)
     train_records = records_by_task_and_stage(
-        records, stage="probe_train", expected_counts=_required_counts(data_config, "probe_train")
+        records,
+        stage="probe_train",
+        expected_counts=_required_counts(data_config, "probe_train", tasks),
+        enabled_tasks=tasks,
     )
     val_records = records_by_task_and_stage(
-        records, stage="probe_val", expected_counts=_required_counts(data_config, "probe_val")
+        records,
+        stage="probe_val",
+        expected_counts=_required_counts(data_config, "probe_val", tasks),
+        enabled_tasks=tasks,
     )
     max_length = int(config["pipeline"]["max_sequence_length"])
     train = build_formal_examples(
@@ -669,10 +1381,10 @@ def _probe_data(config: dict[str, Any], tokenizer, data_config, records):
         target=False,
         max_length=max_length,
     )
-    train_examples = [example for task in FORMAL_TASKS for example in train[task]]
-    train_labels = [index for index, task in enumerate(FORMAL_TASKS) for _ in train[task]]
-    val_examples = [example for task in FORMAL_TASKS for example in validation[task]]
-    val_labels = [index for index, task in enumerate(FORMAL_TASKS) for _ in validation[task]]
+    train_examples = [example for task in _enabled_tasks(config) for example in train[task]]
+    train_labels = [index for index, task in enumerate(_enabled_tasks(config)) for _ in train[task]]
+    val_examples = [example for task in _enabled_tasks(config) for example in validation[task]]
+    val_labels = [index for index, task in enumerate(_enabled_tasks(config)) for _ in validation[task]]
     return train_examples, train_labels, val_examples, val_labels
 
 
@@ -681,11 +1393,15 @@ def _run_probe(config: dict[str, Any], checkpoint: Path) -> dict[str, Any]:
     from src.distributed.fsdp_utils import destroy_distributed, init_distributed
 
     records, data_config, data_hash, _, _ = _data_context(config)
-    partitions, _, base_hash = _load_partitions(config, checkpoint)
+    partitions, base_hash = _load_partitions(
+        config, checkpoint, expected_data_manifest_sha256=data_hash
+    )
     joint_dir = _pipeline_paths(config)["joint_checkpoint_output"]
     manifest_path = joint_dir / "checkpoint_manifest.json"
     if not manifest_path.is_file():
-        raise FileNotFoundError(f"Formal joint checkpoint is missing: {manifest_path}")
+        raise FileNotFoundError(
+            f"STALE_CHECKPOINT_MISMATCH: formal joint checkpoint is missing: {manifest_path}"
+        )
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True, use_fast=True)
     train_examples, train_labels, val_examples, val_labels = _probe_data(
         config, tokenizer, data_config, records
@@ -723,7 +1439,7 @@ def _run_probe(config: dict[str, Any], checkpoint: Path) -> dict[str, Any]:
         data_manifest_sha256=data_hash,
     )
     manifest["partition_sha256_per_task"] = {
-        task: partitions[task].sha256 for task in FORMAL_TASKS
+        task: partitions[task].sha256 for task in _enabled_tasks(config)
     }
     _write_json(_pipeline_paths(config)["probe_output"] / "probe_manifest.json", manifest)
     if distributed_context is not None:
@@ -761,15 +1477,24 @@ def _run_evaluation(config: dict[str, Any], checkpoint: Path) -> dict[str, Any]:
     records, data_config, data_hash, _, expected = _validate_data_for_stage(
         config, stage="stage4_final_eval"
     )
-    partitions, _, base_hash = _load_partitions(config, checkpoint)
+    partitions, base_hash = _load_partitions(
+        config, checkpoint, expected_data_manifest_sha256=data_hash
+    )
     joint_dir = _pipeline_paths(config)["joint_checkpoint_output"]
     probe_dir = _pipeline_paths(config)["probe_output"]
     checkpoint_manifest_path = joint_dir / "checkpoint_manifest.json"
     if not checkpoint_manifest_path.is_file():
-        raise FileNotFoundError("Formal joint checkpoint is required for evaluation")
+        raise FileNotFoundError(
+            "STALE_CHECKPOINT_MISMATCH: formal joint checkpoint is required for evaluation"
+        )
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True, use_fast=True)
-    eval_records = records_by_task_and_stage(records, stage="stage4_final_eval", expected_counts=expected)
-    prompt_records = {task: eval_records[task] for task in FORMAL_TASKS}
+    eval_records = records_by_task_and_stage(
+        records,
+        stage="stage4_final_eval",
+        expected_counts=expected,
+        enabled_tasks=_enabled_tasks(config),
+    )
+    prompt_records = {task: eval_records[task] for task in _enabled_tasks(config)}
     prompt_examples = build_formal_examples(
         prompt_records,
         data_config=data_config,
@@ -810,10 +1535,11 @@ def _run_evaluation(config: dict[str, Any], checkpoint: Path) -> dict[str, Any]:
         hidden_size=int(
             model.module.config.hidden_size if hasattr(model, "module") else model.config.hidden_size
         ),
+        enabled_tasks=_enabled_tasks(config),
         expected_checkpoint_manifest_sha256=sha256_file(checkpoint_manifest_path),
         expected_data_manifest_sha256=data_hash,
         expected_partition_sha256_per_task={
-            task: partitions[task].sha256 for task in FORMAL_TASKS
+            task: partitions[task].sha256 for task in _enabled_tasks(config)
         },
     )
     engine = FormalInferenceEngine(
@@ -821,14 +1547,14 @@ def _run_evaluation(config: dict[str, Any], checkpoint: Path) -> dict[str, Any]:
         banks=banks,
         probe_head=probe_head,
         device=device,
-        probe_task="math",
+        probe_task=_enabled_tasks(config)[0],
     )
     max_new_tokens = config["evaluation"]["max_new_tokens"]
     rows: list[dict[str, Any]] = []
-    task_scores: dict[str, list[dict[str, float]]] = {task: [] for task in FORMAL_TASKS}
+    task_scores: dict[str, list[dict[str, float]]] = {task: [] for task in _enabled_tasks(config)}
     probe_correct = 0
     total_latency = 0.0
-    for task in FORMAL_TASKS:
+    for task in _enabled_tasks(config):
         for record, prompt in zip(eval_records[task], prompt_examples[task]):
             input_ids = prompt.input_ids.unsqueeze(0).to(device)
             attention_mask = prompt.attention_mask.unsqueeze(0).to(device)
@@ -907,7 +1633,7 @@ def _run_evaluation(config: dict[str, Any], checkpoint: Path) -> dict[str, Any]:
         row["probe_prediction"] != row["true_task"] for row in high_confidence_rows
     )
     mode_specific_accuracy: dict[str, float | None] = {}
-    for mode in FORMAL_TASKS:
+    for mode in _enabled_tasks(config):
         selected_rows = [row for row in rows if row["selected_mode"] == mode]
         mode_specific_accuracy[mode] = (
             sum(float(row["correctness"]["accuracy"]) for row in selected_rows)
@@ -931,7 +1657,7 @@ def _run_evaluation(config: dict[str, Any], checkpoint: Path) -> dict[str, Any]:
         ),
         "high_confidence_case_count": len(high_confidence_rows),
         "task_specific_accuracy": {
-            task: mean_metrics(task_scores[task]) for task in FORMAL_TASKS
+            task: mean_metrics(task_scores[task]) for task in _enabled_tasks(config)
         },
         "mode_specific_accuracy": mode_specific_accuracy,
         "end_to_end_accuracy": sum(row["correctness"]["accuracy"] for row in rows) / len(rows),
@@ -952,7 +1678,7 @@ def _run_evaluation(config: dict[str, Any], checkpoint: Path) -> dict[str, Any]:
             if memory_rows
             else None
         ),
-        "partitions": {task: partitions[task].to_dict() for task in FORMAL_TASKS},
+        "partitions": {task: partitions[task].to_dict() for task in _enabled_tasks(config)},
     }
     output = _pipeline_paths(config)["evaluation_output"]
     output.mkdir(parents=True, exist_ok=True)
@@ -983,7 +1709,7 @@ def _validate_only(config: dict[str, Any], checkpoint: Path) -> dict[str, Any]:
         expected = (
             _formal_discovery_counts(config)
             if stage == "stage2_discovery"
-            else _required_counts(data_config, stage)
+            else _required_counts(data_config, stage, _enabled_tasks(config))
         )
         actual = {
             task: sum(
@@ -992,11 +1718,44 @@ def _validate_only(config: dict[str, Any], checkpoint: Path) -> dict[str, Any]:
                 if record.get("task") == task
                 and record.get("assigned_split") == stage
             )
-            for task in FORMAL_TASKS
+            for task in _enabled_tasks(config)
         }
         stage_counts[stage] = actual
         stage_requirements[stage] = expected
     data_ready = stage_counts == stage_requirements
+    paths = _pipeline_paths(config)
+    tasks = _enabled_tasks(config)
+    training = config["training"]
+    data = config["data"]
+    discovery = config["discovery"]
+    partition_status = "PASS"
+    partition_error = None
+    if discovery.get("method") == "linear_cka_min":
+        try:
+            _load_partitions(config, checkpoint, expected_data_manifest_sha256=data_hash)
+        except (RuntimeError, ValueError, FileNotFoundError) as exc:
+            partition_status = "FAIL"
+            partition_error = str(exc)
+    source_mix_status = "PASS"
+    source_mix_error = None
+    if discovery.get("method") == "linear_cka_min":
+        try:
+            training_records = records_by_task_and_stage(
+                records,
+                stage="stage3_adapter_train",
+                expected_counts=None,
+                enabled_tasks=tasks,
+            )
+            validate_training_source_mixture(
+                training_records,
+                data_config=data_config,
+                enabled_tasks=tasks,
+            )
+        except (RuntimeError, ValueError) as exc:
+            source_mix_status = "FAIL"
+            source_mix_error = str(exc)
+    data_ready = data_ready and partition_status == "PASS" and source_mix_status == "PASS"
+    mixture_trainer_reachable = False
     return {
         "status": "PASS" if data_ready else "BLOCKED",
         "model_type": native_config.model_type,
@@ -1006,17 +1765,61 @@ def _validate_only(config: dict[str, Any], checkpoint: Path) -> dict[str, Any]:
         "stage_records_available": stage_counts,
         "stage_records_required": stage_requirements,
         "formal_data_ready": data_ready,
+        "partition_binding": partition_status,
+        "partition_binding_error": partition_error,
+        "source_mixture": source_mix_status,
+        "source_mixture_error": source_mix_error,
+        "resolved": {
+            "model": {
+                "checkpoint": str(checkpoint),
+                "model_type": native_config.model_type,
+                "num_hidden_layers": int(native_config.num_hidden_layers),
+                "hidden_size": int(native_config.hidden_size),
+                "dtype": config["model"]["dtype"],
+            },
+            "enabled_tasks": list(tasks),
+            "task_order": list(training["task_order"]),
+            "training_mode": "sequential_task_training",
+            "mixture_training": bool(data["mixture_training"]),
+            "interleave_across_tasks": bool(data["interleave_across_tasks"]),
+            "formal_train_entrypoint": (
+                f"{train_token_budget_sequential.__module__}."
+                f"{train_token_budget_sequential.__name__}"
+            ),
+            "mixture_trainer_reachable": mixture_trainer_reachable,
+            "discovery": {
+                "method": discovery.get("method"),
+                "metric": discovery.get("metric"),
+                "interval_reduction": discovery.get("interval_reduction"),
+                "similarity_thresholds": discovery.get("similarity_thresholds"),
+                "partition_root": str(paths["discovery_output"]),
+                "partition_paths": {
+                    task: str(_discovery_partition_paths(config)[task]) for task in tasks
+                } if discovery.get("method") == "linear_cka_min" else {},
+            },
+            "resume_checkpoint": str(paths["joint_checkpoint_output"]),
+            "resume_policy": "explicit --resume only; no latest/glob discovery",
+            "output_directories": {
+                key: str(paths[key])
+                for key in (
+                    "discovery_output",
+                    "joint_checkpoint_output",
+                    "probe_output",
+                    "evaluation_output",
+                )
+            },
+        },
         "status_note": (
             "ready for explicit stage execution"
             if data_ready
-            else "formal manifest counts are below qwen3_14b_config.yaml; execution will fail fast"
+            else "formal manifest counts do not satisfy the configured stage requirements; execution will fail fast"
         ),
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Explicit formal Qwen3 task-adaptive pipeline")
-    parser.add_argument("--config", default="qwen3_14b_config.yaml")
+    parser.add_argument("--config", required=True, help="Formal YAML configuration; must be explicit")
     parser.add_argument(
         "--stage",
         choices=("validate", "connectivity", "discovery", "train", "probe", "evaluate", "all"),
@@ -1024,6 +1827,7 @@ def main() -> None:
     )
     parser.add_argument("--connectivity-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--max-steps", type=int, default=None, help="Only for a bounded local training smoke test")
+    parser.add_argument("--resume", action="store_true", help="Resume the sequential formal training checkpoint")
     args = parser.parse_args()
     if args.max_steps is not None and args.max_steps <= 0:
         raise ValueError("--max-steps must be positive")
@@ -1041,6 +1845,7 @@ def main() -> None:
         print(json.dumps(_validate_only(config, checkpoint), indent=2, sort_keys=True))
         return
     if stage == "discovery":
+        _prepare_run_manifest(config)
         print(json.dumps(_run_formal_discovery(config, checkpoint), indent=2, sort_keys=True))
         return
     if stage == "train":
@@ -1052,12 +1857,13 @@ def main() -> None:
                     config_path=args.config,
                     stage="train",
                     max_steps=args.max_steps,
+                    resume=args.resume,
                 ),
                 indent=2,
                 sort_keys=True,
             ))
             return
-        print(json.dumps(_run_train(config, checkpoint, max_steps=args.max_steps), indent=2, sort_keys=True))
+        print(json.dumps(_run_train(config, checkpoint, max_steps=args.max_steps, resume=args.resume), indent=2, sort_keys=True))
         return
     if stage == "probe":
         if int(os.environ.get("WORLD_SIZE", "1")) == 1:
@@ -1093,6 +1899,7 @@ def main() -> None:
         raise ValueError("--max-steps is not allowed with --stage all")
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
         raise RuntimeError("Formal all stage must be launched by a single coordinator")
+    _prepare_run_manifest(config)
     discovery = _run_formal_discovery(config, checkpoint)
     training = _launch_formal_stage(
         config,

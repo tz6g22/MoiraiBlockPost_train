@@ -1,37 +1,43 @@
-# Qwen3-14B Task-Adaptive Inference Block AttnRes
-# Formal Post-Training Configuration
+# Qwen3-1.7B Task-Adaptive Inference Block AttnRes
+# Two-task formal configuration: Math + Multi-hop only.
+# Code remains implemented but is inactive in this two-task experiment.
 #
-# 上位方法定义：
+# Method definitions:
 #   Task_Adaptive_Inference_Block_AttnRes_SPEC_CN.md
-# 修改计划：
 #   Task_Adaptive_Inference_Block_AttnRes_MODIFICATION_PLAN.md
-#
-# 本文件只针对 Qwen3-14B 正式实验。
-# Fixed mode 完全禁用：不训练、不保存、不路由、不作为 Probe fallback。
 
 experiment:
-  name: qwen3_14b_task_adaptive_attnres
+  name: qwen3_1_7b_task_adaptive_attnres
   seed: 42
   model_family: qwen3
-  model_size: 14b
+  model_size: 1.7b
   mode: formal_posttraining
 
 model:
-  base_model_path: ${QWEN3_14B_PATH}
+  base_model_path: ${QWEN3_1_7B_PATH}
   infer_architecture_from_checkpoint: true
+
+  # Validation only; runtime structure must still be read from checkpoint.
+  expected_num_hidden_layers: 28
+  expected_hidden_size: 2048
+
   dtype: bfloat16
   use_cache_train: false
   gradient_checkpointing: true
+  max_seq_length: 4096
+
   discovery_model_mode: original_pretrained_transformer
 
 pipeline:
-  data_config: configs/data.yaml
-  data_manifest: outputs/data/splits.json
-  discovery_output: outputs/formal/discovery_formal
-  joint_checkpoint_output: outputs/formal/joint_checkpoint
-  probe_output: outputs/formal/probe
-  evaluation_output: outputs/formal/evaluation
-  max_sequence_length: 2048
+  run_id: qwen3_1_7b_formal_retrain_seed42
+  run_root: outputs/formal_retrain/shared
+  data_config: configs/data_qwen3_1.7b.yaml
+  data_manifest: outputs/formal_retrain/shared/data/splits.json
+  discovery_output: outputs/formal_retrain/main/discovery
+  joint_checkpoint_output: outputs/formal_retrain/main/checkpoint
+  probe_output: outputs/formal_retrain/main/probe
+  evaluation_output: outputs/formal_retrain/main/evaluation
+  max_sequence_length: 4096
 
 attnres:
   enabled_after_discovery_only: true
@@ -68,7 +74,6 @@ tasks:
   enabled:
     - math
     - multihop
-    - code
 
   fixed:
     enabled: false
@@ -80,25 +85,34 @@ tasks:
 discovery:
   enabled: true
   model_mode: original_residual_only
-  ordinary_residual_cost_defined: true
+  method: linear_cka_min
+  metric: linear_cka
+  interval_reduction: min
+  ordinary_residual_only: true
 
   forbid_attnres: true
   forbid_query: true
   forbid_alpha: true
+  forbid_backward: true
   forbid_true_moirai_replay: true
   forbid_fixed_replay: true
-
   undefined_cost_behavior: fail
-  undefined_cost_status: MERGE_THRESHOLD_UNDEFINED
 
+  residual_definition: "v_l = h_(l+1) - h_l"
+  padding_mask: true
+  fp32_accumulation: true
+
+  # Reduced for the 1.7B setup; sufficient for stable partition estimation
+  # without making Discovery the dominant compute cost.
   cases:
-    math: 1000
-    multihop: 1000
-    code: 500
+    math: 200
+    multihop: 200
 
   sample_from_final_task_mixture: true
   exclude_from_posttraining: true
-  merge_cost_threshold: null
+  similarity_thresholds:
+    math: 0.40
+    multihop: 0.40
 
   partition:
     unit: complete_transformer_block
@@ -106,50 +120,47 @@ discovery:
     non_overlapping: true
     full_coverage: true
     block_length_constraints_from_partition_config: true
+
+    # Block count is the result of threshold-driven Discovery.
     min_block_length: 1
+
     deterministic_tie_break: true
 
   freeze_partition_after_discovery: true
   hash_partition: true
 
+  execution:
+    batch_size: 1
+    case_by_case_streaming: true
+    retain_full_dataset_activations: false
+
 data:
   budget_unit: non_padding_tokens
 
   token_budget:
-    math: 10000000
-    multihop: 10000000
-    code: 10000000
-    total: 30000000
+    math: 500000
+    multihop: 500000
+    total: 1000000
 
   source_policy: local_first_then_external_topup
 
   math:
     local_sources:
       - gsm8k
-      - svamp
-    external_topup_priority:
-      - math_train
-      - openmathinstruct2
+    external_topup_priority: []
 
   multihop:
     local_sources:
       - clutrr
-      - hotpotqa
-    external_topup_priority:
-      - musique
-      - 2wikimultihopqa
-
-  code:
-    local_sources:
-      - mbpp
-    external_topup_priority:
-      - xcoder_80k
+    external_topup_priority: []
 
   mixture_training: false
-  sequential_dataset_training: true
+  sequential_task_training: true
   shuffle: true
   interleave_across_sources: true
   interleave_across_tasks: false
+  source_sampling: fixed_weight_cycle
+  source_replacement: true
 
   normalize_prompt_format: true
   normalize_target_format: true
@@ -159,8 +170,11 @@ data:
     stable_ids: true
     hash_audit: true
     discovery_vs_train_disjoint: true
+
+    # Probe is routing-only and may reuse Discovery examples.
     probe_vs_discovery_disjoint: false
     probe_vs_train_disjoint: true
+
     eval_vs_all_training_disjoint: true
     exact_dedup: true
     normalized_text_dedup: true
@@ -178,13 +192,11 @@ training:
   task_order:
     - math
     - multihop
-    - code
 
   task_sampling:
     strategy: sequential_by_task_order
     math_weight: 1.0
     multihop_weight: 1.0
-    code_weight: 1.0
 
   optimizer:
     name: adamw
@@ -192,15 +204,23 @@ training:
     eps: 1.0e-8
 
     parameter_groups:
+      # Slightly higher than the larger-model backbone LR, but still conservative
+      # for full-parameter post-training of a 1.7B model.
       backbone:
-        lr: 3.0e-6
+        lr: 5.0e-6
         weight_decay: 0.1
 
       attnres:
         lr: 3.0e-5
         weight_decay: 0.0
 
-    preserve_lr_ratio: true
+      query:
+        lr: 3.0e-5
+        weight_decay: 0.0
+
+      alpha:
+        lr: 1.0e-4
+        weight_decay: 0.0
 
   scheduler:
     type: cosine
@@ -225,6 +245,7 @@ training:
   batching:
     micro_batch_size: 1
     gradient_accumulation_steps: 1
+    target_global_non_padding_tokens_per_step: 8192
     dynamic_padding: true
     count_non_padding_tokens: true
 
@@ -234,6 +255,8 @@ training:
 
   metrics:
     window_size: 20
+    validation_interval_steps: 100
+    validation_examples_per_task: 32
 
   checkpointing:
     save_final: true
@@ -244,11 +267,12 @@ training:
 
 distributed:
   strategy: fsdp
+  discovery_processes_per_node: 1
+  discovery_master_port: 29527
+  formal_processes_per_node: 2
+  formal_master_port: 29528
+  max_nodes: 1
   activation_checkpointing: true
-  discovery_processes_per_node: 4
-  discovery_master_port: 29517
-  formal_processes_per_node: 4
-  formal_master_port: 29518
 
   fsdp:
     enabled_if_selected: true
@@ -267,7 +291,7 @@ identity_test:
   before_training: true
 
   compare:
-    - original_qwen3_14b
+    - original_qwen3_1_7b
     - converted_attnres_alpha_zero
 
   fail_status: IDENTITY_CONVERSION_FAILED
@@ -289,24 +313,17 @@ verification:
 probe:
   enabled: true
 
-  seed: 42
-  feature_batch_size: 1
-  batch_size: 32
-  max_epochs: 20
-  learning_rate: 1.0e-3
-  weight_decay: 1.0e-4
-
   labels:
     - math
     - multihop
-    - code
 
-  num_classes: 3
+  num_classes: 2
+  train_cases_per_class: 100
+  val_cases_per_class: 50
 
   fixed_label: false
   fixed_fallback: false
-
-  routing_rule: argmax_three_way
+  routing_rule: argmax_two_way
   high_confidence_threshold: 0.5
   confidence_fallback: none
 
@@ -320,8 +337,6 @@ inference:
       config_bundle: [P_math, Q_math, Alpha_math]
     multihop:
       config_bundle: [P_multihop, Q_multihop, Alpha_multihop]
-    code:
-      config_bundle: [P_code, Q_code, Alpha_code]
 
   fixed_route: false
   restart_original_input_from_layer0: true
@@ -351,6 +366,10 @@ checkpoint:
     - seed
 
   forbid_keys:
+    - P_code
+    - Q_code
+    - Alpha_code
+    - code_checkpoint
     - P_fixed
     - Q_fixed
     - Alpha_fixed
@@ -361,12 +380,10 @@ evaluation:
   tasks:
     - math
     - multihop
-    - code
 
   max_new_tokens:
     math: 128
     multihop: 16
-    code: 256
 
   evaluate_fixed: false
 
@@ -394,7 +411,6 @@ fail_fast:
   discovery_uses_attnres: true
   discovery_uses_query: true
   discovery_uses_alpha: true
-  merge_threshold_undefined: true
   identity_test_failed: true
   backbone_not_updated: true
   partition_changed: true
@@ -403,6 +419,7 @@ fail_fast:
   nan_or_inf_loss: true
   data_leakage: true
   checkpoint_mismatch: true
+  unexpected_code_branch: true
 
 legacy:
   disable_fixed_mode: true

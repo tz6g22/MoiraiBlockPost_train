@@ -170,19 +170,32 @@ def select_training_records(
     *,
     task: str,
     config: dict[str, Any],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     if task not in TASKS:
         raise ValueError(f"Unknown baseline task: {task}")
     records = load_manifest(config["data_manifest"])
     data_config = load_yaml(config["data_config"])
-    source_key = TASK_TO_SOURCE[task]
-    source = data_config["sources"][source_key]
+    source_keys = tuple(
+        str(value)
+        for value in data_config.get("training_sources", {}).get(
+            task,
+            (TASK_TO_SOURCE[task],),
+        )
+    )
+    sources = {}
+    for source_key in source_keys:
+        source = data_config["sources"].get(source_key)
+        if source is None:
+            raise ValueError(f"Baseline source is not configured: {source_key}")
+        sources[str(source["dataset_name"])] = source
+    if not sources:
+        raise ValueError(f"Baseline task has no configured training sources: {task}")
     candidates = [
         record
         for record in records
         if record.get("assigned_split") == config["training_source_split"]
         and record.get("task") == task
-        and record.get("dataset") == source["dataset_name"]
+        and record.get("dataset") in sources
     ]
     candidates.sort(key=lambda record: str(record["stable_id"]))
     count = int(config["training_cases_per_task"])
@@ -211,7 +224,7 @@ def select_training_records(
             or str(record.get("content_sha256")) in selected_content
         ):
             raise RuntimeError("Baseline training selection leaks into a forbidden split")
-    return selected, source
+    return selected, sources
 
 
 def load_training_examples(
@@ -220,10 +233,19 @@ def load_training_examples(
     config: dict[str, Any],
     tokenizer,
 ) -> tuple[tuple[Any, ...], list[str]]:
-    records, source = select_training_records(task=task, config=config)
-    pool = load_dataset_pool(load_yaml(config["data_config"]), source["dataset_name"])
+    records, sources = select_training_records(task=task, config=config)
+    data_config = load_yaml(config["data_config"])
+    pools = {
+        dataset_name: load_dataset_pool(data_config, dataset_name)
+        for dataset_name in sources
+    }
     examples = []
     for record in records:
+        pool = pools.get(str(record["dataset"]))
+        if pool is None:
+            raise ValueError(
+                f"Baseline record uses an unconfigured source: {record['dataset']}"
+            )
         dataset, field_mapping = pool[str(record["official_split"])]
         examples.append(
             encode_prompt_target(

@@ -387,3 +387,39 @@ def peak_memory_bytes(context: DistributedContext) -> list[int] | None:
         return None
     assert gathered is not None
     return [int(item.item()) for item in gathered]
+
+
+def peak_memory_stats(context: DistributedContext) -> list[dict[str, int]] | None:
+    """Collect peak allocated and reserved CUDA memory for every rank/GPU."""
+    if context.device.type != "cuda":
+        return None
+    value = torch.tensor(
+        [
+            torch.cuda.max_memory_allocated(context.device),
+            torch.cuda.max_memory_reserved(context.device),
+            context.local_rank,
+        ],
+        dtype=torch.long,
+        device=context.device,
+    )
+    if not context.distributed:
+        return [{
+            "rank": int(context.rank),
+            "gpu": int(context.local_rank),
+            "peak_allocated_bytes": int(value[0].item()),
+            "peak_reserved_bytes": int(value[1].item()),
+        }]
+    gathered = [torch.zeros_like(value) for _ in range(context.world_size)] if context.is_rank0 else None
+    dist.gather(value, gather_list=gathered, dst=0)
+    if not context.is_rank0:
+        return None
+    assert gathered is not None
+    return [
+        {
+            "rank": rank,
+            "gpu": int(item[2].item()),
+            "peak_allocated_bytes": int(item[0].item()),
+            "peak_reserved_bytes": int(item[1].item()),
+        }
+        for rank, item in enumerate(gathered)
+    ]

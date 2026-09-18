@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from typing import Any
 
 from src.common import load_yaml, sha256_json
+from src.data.format_tasks import TASK_TO_SOURCE
 
 
-FORMAL_TASKS = ("math", "multihop", "code")
+SUPPORTED_TASKS = tuple(TASK_TO_SOURCE)
 _FORBIDDEN_FIXED_KEYS = (
     "P_fixed",
     "Q_fixed",
@@ -23,18 +25,28 @@ def load_formal_config(path: str | Path) -> dict[str, Any]:
     return config
 
 
+def enabled_tasks(config: dict[str, Any]) -> tuple[str, ...]:
+    tasks = tuple(str(task) for task in config.get("tasks", {}).get("enabled", ()))
+    if len(tasks) < 2 or len(set(tasks)) != len(tasks):
+        raise ValueError("Formal tasks.enabled must contain at least two unique tasks")
+    unsupported = sorted(set(tasks) - set(SUPPORTED_TASKS))
+    if unsupported:
+        raise ValueError(f"Unsupported formal tasks: {unsupported}")
+    return tasks
+
+
 def validate_formal_config(config: dict[str, Any]) -> None:
     experiment = config.get("experiment", {})
     if (
         experiment.get("model_family") != "qwen3"
-        or experiment.get("model_size") != "14b"
         or experiment.get("mode") != "formal_posttraining"
     ):
-        raise ValueError("Formal config must target Qwen3-14B formal post-training")
+        raise ValueError("Formal config must target Qwen3 formal post-training")
+    tasks = enabled_tasks(config)
 
     model = config.get("model", {})
     if model.get("dtype") != "bfloat16":
-        raise ValueError("Formal Qwen3-14B runtime must use bfloat16 parameters")
+        raise ValueError("Formal Qwen3 runtime must use bfloat16 parameters")
     if model.get("infer_architecture_from_checkpoint") is not True:
         raise ValueError("Formal runtime must infer architecture from the checkpoint")
     if model.get("discovery_model_mode") != "original_pretrained_transformer":
@@ -58,19 +70,16 @@ def validate_formal_config(config: dict[str, Any]) -> None:
     if int(pipeline.get("max_sequence_length", 0)) <= 0:
         raise ValueError("Formal pipeline max_sequence_length must be positive")
 
-    tasks = tuple(config.get("tasks", {}).get("enabled", ()))
-    if tasks != FORMAL_TASKS:
-        raise ValueError(f"Formal tasks must be exactly {FORMAL_TASKS}, got {tasks}")
     fixed = config.get("tasks", {}).get("fixed", {})
     if any(bool(fixed.get(key)) for key in ("enabled", "train", "checkpoint", "route", "fallback")):
-        raise ValueError("Fixed mode is disabled in the formal Qwen3-14B pipeline")
+        raise ValueError("Fixed mode is disabled in the formal Qwen3 pipeline")
 
     discovery = config.get("discovery", {})
     if discovery.get("enabled") is not True:
         raise ValueError("Formal Discovery must be enabled")
+    discovery_method = discovery.get("method")
     required_discovery_flags = {
         "model_mode": "original_residual_only",
-        "ordinary_residual_cost_defined": True,
         "forbid_attnres": True,
         "forbid_query": True,
         "forbid_alpha": True,
@@ -81,16 +90,47 @@ def validate_formal_config(config: dict[str, Any]) -> None:
     for key, expected in required_discovery_flags.items():
         if discovery.get(key) != expected:
             raise ValueError(f"Formal Discovery config mismatch for {key}: {discovery.get(key)!r}")
+    if discovery_method == "linear_cka_min":
+        for key in ("run_id", "run_root"):
+            if not isinstance(pipeline.get(key), str) or not pipeline[key].strip():
+                raise ValueError(f"Formal CKA pipeline is missing {key}")
+        if discovery.get("ordinary_residual_only") is not True:
+            raise ValueError("Linear CKA Discovery must use ordinary residuals only")
+        if discovery.get("metric") != "linear_cka":
+            raise ValueError("Formal Discovery metric must be linear_cka")
+        if discovery.get("interval_reduction") != "min":
+            raise ValueError("Formal Discovery must use min pairwise CKA interval scores")
+        thresholds = discovery.get("similarity_thresholds")
+        if not isinstance(thresholds, dict) or set(thresholds) != set(tasks):
+            raise ValueError("Formal CKA thresholds must be declared for every enabled task")
+        for task, value in thresholds.items():
+            if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"Invalid Linear CKA threshold for {task}")
+        if "merge_cost_threshold" in discovery:
+            raise ValueError("Linear CKA formal Discovery cannot declare merge_cost_threshold")
+        if "discovery_partitions" in pipeline:
+            raise ValueError("Formal CKA partitions must be generated dynamically per run")
+    else:
+        if discovery.get("ordinary_residual_cost_defined") is not True:
+            raise RuntimeError("RESIDUAL_DISCOVERY_COST_UNDEFINED")
     if discovery.get("sample_from_final_task_mixture") is not True:
         raise ValueError("Formal Discovery must sample from the final task mixture")
     if discovery.get("exclude_from_posttraining") is not True:
         raise ValueError("Discovery cases must be excluded from post-training")
     discovery_cases = discovery.get("cases", {})
-    if set(discovery_cases) != set(FORMAL_TASKS) or any(
-        int(discovery_cases.get(task, 0)) <= 0 for task in FORMAL_TASKS
-    ):
+    if any(int(discovery_cases.get(task, 0)) <= 0 for task in tasks):
         raise ValueError("Formal Discovery must declare a positive case count for every task")
     partition = discovery.get("partition", {})
+    if discovery_method != "linear_cka_min":
+        if "merge_cost_threshold" not in discovery:
+            raise ValueError("Formal Discovery must declare merge_cost_threshold")
+        threshold = discovery.get("merge_cost_threshold")
+        if threshold is not None and (
+            not isinstance(threshold, (int, float))
+            or not math.isfinite(float(threshold))
+            or float(threshold) < 0
+        ):
+            raise ValueError("merge_cost_threshold must be null or finite and non-negative")
     if partition.get("unit") != "complete_transformer_block":
         raise ValueError("Formal Discovery partitions must use complete Transformer blocks")
     for key in (
@@ -98,18 +138,19 @@ def validate_formal_config(config: dict[str, Any]) -> None:
         "non_overlapping",
         "full_coverage",
         "block_length_constraints_from_partition_config",
-        "candidate_block_count_from_partition_config",
-        "no_adjacent_singletons",
         "deterministic_tie_break",
     ):
         if partition.get(key) is not True:
             raise ValueError(f"Formal Discovery partition contract requires {key}=true")
-    if partition.get("fixed_block_size") != 4:
-        raise ValueError("Formal Discovery fixed_block_size must be 4")
-    if partition.get("num_blocks_policy") != "ceil_num_layers_over_fixed_block_size":
-        raise ValueError("Formal Discovery must derive N from model depth and fixed block size")
-    if partition.get("min_block_length") != 2 or partition.get("max_block_length") != 6:
-        raise ValueError("Formal Qwen3-14B Discovery must use block lengths in [2, 6]")
+    if partition.get("min_block_length") != 1:
+        raise ValueError("Formal Discovery must allow singleton blocks")
+    max_length = partition.get("max_block_length")
+    if max_length is not None and (
+        not isinstance(max_length, int) or max_length < 1
+    ):
+        raise ValueError("Formal Discovery max_block_length must be null or positive")
+    if partition.get("no_adjacent_singletons", False) is True:
+        raise ValueError("Formal Discovery must allow adjacent singleton blocks")
 
     attnres = config.get("attnres", {})
     if attnres.get("enabled_after_discovery_only") is not True:
@@ -157,13 +198,25 @@ def validate_formal_config(config: dict[str, Any]) -> None:
     data = config.get("data", {})
     if data.get("budget_unit") != "non_padding_tokens":
         raise ValueError("Formal budgets must count non-padding input tokens")
-    if data.get("mixture_training") is not True:
-        raise ValueError("Formal training must enable task/data mixture training")
-    if data.get("sequential_dataset_training") is not False:
-        raise ValueError("Formal training cannot use sequential dataset training")
-    for key in ("shuffle", "interleave_across_sources", "interleave_across_tasks"):
-        if data.get(key) is not True:
-            raise ValueError(f"Formal data mixture must enable {key}")
+    if data.get("mixture_training") is not False:
+        raise ValueError("TRAINING_MODE_MISMATCH: formal training must disable task mixture training")
+    if discovery_method == "linear_cka_min":
+        if data.get("sequential_task_training") is not True:
+            raise ValueError("TRAINING_MODE_MISMATCH: formal training must use sequential task training")
+    elif data.get("sequential_dataset_training") is not True:
+        raise ValueError("TRAINING_MODE_MISMATCH: formal training must use sequential task training")
+    if data.get("shuffle") is not True or data.get("interleave_across_sources") is not True:
+        raise ValueError("Formal training must shuffle and interleave sources within each task")
+    if data.get("interleave_across_tasks") is not False:
+        raise ValueError("TRAINING_MODE_MISMATCH: formal training cannot interleave tasks")
+    if discovery_method == "linear_cka_min":
+        if data.get("source_sampling") != "fixed_weight_cycle":
+            raise ValueError("Formal task data must use fixed_weight_cycle source sampling")
+        if data.get("source_replacement") is not True:
+            raise ValueError("Formal source sampling must replace exhausted sources")
+    task_order = tuple(config.get("training", {}).get("task_order", ()))
+    if task_order != tasks:
+        raise ValueError("TASK_ORDER_MISMATCH: formal training.task_order must exactly match tasks.enabled")
     if data.get("source_policy") != "local_first_then_external_topup":
         raise ValueError("Formal data must use local_first_then_external_topup")
     for key in ("normalize_prompt_format", "normalize_target_format", "normalize_loss_mask"):
@@ -181,22 +234,26 @@ def validate_formal_config(config: dict[str, Any]) -> None:
     ):
         if isolation.get(key) is not True:
             raise ValueError(f"Formal data isolation requires {key}=true")
+    if isolation.get("probe_vs_discovery_disjoint") is not False:
+        raise ValueError(
+            "Formal data isolation must explicitly allow only probe_train/discovery reuse"
+        )
     token_budget = data.get("token_budget", {})
-    if any(int(token_budget.get(task, 0)) <= 0 for task in FORMAL_TASKS):
+    if any(int(token_budget.get(task, 0)) <= 0 for task in tasks):
         raise ValueError("Each formal task must have a positive token budget")
-    if int(token_budget.get("total", 0)) != sum(int(token_budget[task]) for task in FORMAL_TASKS):
+    if int(token_budget.get("total", 0)) != sum(int(token_budget[task]) for task in tasks):
         raise ValueError("Formal total token budget does not equal task budgets")
 
     training = config.get("training", {})
     if training.get("type") != "full_parameter_joint_posttraining":
-        raise ValueError("Formal training must be full-parameter joint post-training")
+        raise ValueError("TRAINING_MODE_MISMATCH: formal training must be full-parameter joint post-training")
     for key in ("shared_backbone", "train_backbone", "train_query", "train_alpha"):
         if training.get(key) is not True:
             raise ValueError(f"Formal training flag {key} must be true")
     if training.get("train_partition") is not False:
         raise ValueError("Formal partitions must be frozen during training")
-    if training.get("task_sampling", {}).get("strategy") != "balanced_by_token_budget":
-        raise ValueError("Formal task sampling must be balanced_by_token_budget")
+    if training.get("task_sampling", {}).get("strategy") != "sequential_by_task_order":
+        raise ValueError("TRAINING_MODE_MISMATCH: formal task sampling must be sequential_by_task_order")
     batching = training.get("batching", {})
     if int(batching.get("micro_batch_size", 0)) != 1:
         raise ValueError("The formal trainer currently requires micro_batch_size=1")
@@ -221,6 +278,8 @@ def validate_formal_config(config: dict[str, Any]) -> None:
     for key in ("save_final", "save_optimizer_state", "save_scheduler_state", "save_rng_state"):
         if checkpointing.get(key) is not True:
             raise ValueError(f"Formal checkpointing requires {key}=true")
+    if int(training.get("metrics", {}).get("window_size", 0)) <= 0:
+        raise ValueError("Formal metrics.window_size must be positive")
 
     distributed = config.get("distributed", {})
     if int(distributed.get("discovery_processes_per_node", 0)) <= 0:
@@ -237,7 +296,7 @@ def validate_formal_config(config: dict[str, Any]) -> None:
         raise ValueError("Formal distributed backends must be mutually exclusive")
     if distributed.get("strategy") != "fsdp":
         raise ValueError(
-            "The formal Qwen3-14B implementation requires distributed.strategy=fsdp"
+            "The formal Qwen3 implementation requires distributed.strategy=fsdp"
         )
     if distributed.get("fsdp", {}).get("enabled_if_selected") is not True:
         raise ValueError("Formal FSDP backend must be enabled")
@@ -252,14 +311,17 @@ def validate_formal_config(config: dict[str, Any]) -> None:
     if float(optimizer.get("eps", 0.0)) != 1.0e-8:
         raise ValueError("Formal optimizer eps must be 1e-8")
     groups = optimizer.get("parameter_groups", {})
-    expected_groups = {
-        "backbone": (3.0e-6, 0.1),
-        "attnres": (3.0e-5, 0.0),
-    }
-    for name, (lr, weight_decay) in expected_groups.items():
+    for name in ("backbone", "attnres"):
         group = groups.get(name, {})
-        if float(group.get("lr", 0.0)) != lr or float(group.get("weight_decay", -1.0)) != weight_decay:
-            raise ValueError(f"Formal optimizer group {name} does not match the 14B config")
+        if float(group.get("lr", 0.0)) <= 0.0 or float(group.get("weight_decay", -1.0)) < 0.0:
+            raise ValueError(f"Formal optimizer group {name} is invalid")
+    split_groups = [groups.get(name) for name in ("query", "alpha")]
+    if any(group is not None for group in split_groups):
+        if any(not isinstance(group, dict) for group in split_groups):
+            raise ValueError("Formal query and alpha optimizer groups must be declared together")
+        for name, group in zip(("query", "alpha"), split_groups):
+            if float(group.get("lr", 0.0)) <= 0.0 or float(group.get("weight_decay", -1.0)) < 0.0:
+                raise ValueError(f"Formal optimizer group {name} is invalid")
     scheduler = training.get("scheduler", {})
     if scheduler.get("type") != "cosine" or float(scheduler.get("warmup_ratio", -1.0)) != 0.03:
         raise ValueError("Formal scheduler must be cosine with warmup_ratio=0.03")
@@ -278,8 +340,9 @@ def validate_formal_config(config: dict[str, Any]) -> None:
     identity = config.get("identity_test", {})
     if identity.get("required") is not True or identity.get("before_training") is not True:
         raise ValueError("Formal training requires a pre-training identity test")
-    if identity.get("compare") != ["original_qwen3_14b", "converted_attnres_alpha_zero"]:
-        raise ValueError("Formal identity test must compare original Qwen3 and zero-alpha conversion")
+    compare = identity.get("compare", ())
+    if len(compare) != 2 or compare[1] != "converted_attnres_alpha_zero":
+        raise ValueError("Formal identity test must compare Qwen3 and zero-alpha conversion")
     if identity.get("fail_status") != "IDENTITY_CONVERSION_FAILED":
         raise ValueError("Formal identity test fail status is not configured")
     if identity.get("metrics") != ["max_abs_logit_diff", "mean_abs_logit_diff"]:
@@ -296,10 +359,16 @@ def validate_formal_config(config: dict[str, Any]) -> None:
             raise ValueError(f"Formal verification requires {key}=true")
 
     probe = config.get("probe", {})
-    if probe.get("labels") != list(FORMAL_TASKS):
-        raise ValueError("Formal Probe labels must be exactly math/multihop/code")
-    if probe.get("routing_rule") != "argmax_three_way":
-        raise ValueError("Formal Probe must use argmax_three_way")
+    if probe.get("labels") != list(tasks):
+        raise ValueError("Formal Probe labels must match tasks.enabled")
+    if probe.get("num_classes") != len(tasks):
+        raise ValueError("Formal Probe num_classes must equal len(tasks.enabled)")
+    routing_rule = {
+        2: "argmax_two_way",
+        3: "argmax_three_way",
+    }.get(len(tasks), f"argmax_{len(tasks)}_way")
+    if probe.get("routing_rule") != routing_rule:
+        raise ValueError("Formal Probe routing rule must match tasks.enabled")
     high_confidence_threshold = float(probe.get("high_confidence_threshold", -1.0))
     if not 0.0 <= high_confidence_threshold <= 1.0:
         raise ValueError("Formal Probe high_confidence_threshold must be in [0, 1]")
@@ -315,9 +384,8 @@ def validate_formal_config(config: dict[str, Any]) -> None:
 
     inference = config.get("inference", {})
     expected_routes = {
-        "math": ["P_math", "Q_math", "Alpha_math"],
-        "multihop": ["P_multihop", "Q_multihop", "Alpha_multihop"],
-        "code": ["P_code", "Q_code", "Alpha_code"],
+        task: [f"P_{task}", f"Q_{task}", f"Alpha_{task}"]
+        for task in tasks
     }
     if inference.get("routes") != {
         task: {"config_bundle": bundle} for task, bundle in expected_routes.items()
@@ -337,8 +405,13 @@ def validate_formal_config(config: dict[str, Any]) -> None:
             raise ValueError(f"Formal inference must disable {key}")
 
     evaluation = config.get("evaluation", {})
-    if evaluation.get("tasks") != list(FORMAL_TASKS):
-        raise ValueError("Formal evaluation tasks must be exactly math/multihop/code")
+    if evaluation.get("tasks") != list(tasks):
+        raise ValueError("Formal evaluation tasks must match tasks.enabled")
+    max_new_tokens = evaluation.get("max_new_tokens", {})
+    if set(max_new_tokens) != set(tasks) or any(
+        int(max_new_tokens[task]) <= 0 for task in tasks
+    ):
+        raise ValueError("Formal evaluation max_new_tokens must match tasks.enabled")
     if evaluation.get("evaluate_fixed") is not False:
         raise ValueError("Formal evaluation cannot include a Fixed route")
     required_case_fields = {
@@ -398,9 +471,9 @@ def resolve_base_model_path(config: dict[str, Any]) -> Path:
     resolved = os.path.expandvars(raw)
     if "$" in resolved:
         raise RuntimeError(
-            "Qwen3-14B checkpoint path is unresolved; set QWEN3_14B_PATH before formal execution"
+            "Qwen3 checkpoint path is unresolved; set the configured model path before formal execution"
         )
     path = Path(resolved)
     if not path.exists():
-        raise FileNotFoundError(f"Qwen3-14B checkpoint does not exist: {path}")
+        raise FileNotFoundError(f"Qwen3 checkpoint does not exist: {path}")
     return path

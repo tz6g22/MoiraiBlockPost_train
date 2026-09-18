@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,16 @@ def _load_source(source: dict[str, Any]):
     return load_local_split(path, str(source["official_split"]))
 
 
+def _enabled_tasks(config: dict[str, Any]) -> tuple[str, ...]:
+    tasks = tuple(str(task) for task in config.get("enabled_tasks", TASK_TO_SOURCE))
+    if not tasks or len(set(tasks)) != len(tasks):
+        raise ValueError("enabled_tasks must contain unique task names")
+    unsupported = set(tasks) - set(TASK_TO_SOURCE)
+    if unsupported:
+        raise ValueError(f"Unsupported data tasks: {sorted(unsupported)}")
+    return tasks
+
+
 def _entry(
     *,
     task: str,
@@ -51,6 +62,7 @@ def _entry(
     row: dict[str, Any],
     assigned_split: str,
     seed: int,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     dataset_name = str(source["dataset_name"])
     mapping = source["field_mapping"]
@@ -60,7 +72,7 @@ def _entry(
         row=row,
         mapping=mapping,
     )
-    return {
+    entry = {
         "stable_id": stable_id,
         "dataset": dataset_name,
         "dataset_revision": source["revision"],
@@ -75,6 +87,9 @@ def _entry(
         "assigned_split": assigned_split,
         "task": task,
     }
+    if run_id is not None:
+        entry["run_id"] = run_id
+    return entry
 
 
 def _ordered_unique_pool(
@@ -175,11 +190,10 @@ def _stage_source_sections(
             )
             else ("sources",)
         )
-    elif stage in {"probe_train", "probe_val"}:
-        sections = (
-            "probe_sources",
-            "sources",
-        )
+    elif stage == "probe_train":
+        sections = ("probe_sources", "sources")
+    elif stage == "probe_val":
+        sections = ("probe_sources", "validation_sources", "sources")
     else:
         sections = ("sources",)
     return sections
@@ -222,6 +236,7 @@ def _append_assignments(
     assignments: tuple[tuple[str, int], ...],
     task: str,
     seed: int,
+    run_id: str | None = None,
 ) -> None:
     for assigned_split, count in assignments:
         selected = 0
@@ -236,6 +251,7 @@ def _append_assignments(
                 row=row,
                 assigned_split=assigned_split,
                 seed=seed,
+                run_id=run_id,
             )
             existing_id_splits = stable_id_splits.get(entry["stable_id"], set())
             existing_content_splits = content_hash_splits.get(
@@ -261,21 +277,59 @@ def _append_assignments(
             )
 
 
-def prepare(config_path: str | Path) -> dict[str, Any]:
+def _weighted_counts(
+    total: int,
+    source_keys: tuple[str, ...],
+    weights: dict[str, Any],
+) -> dict[str, int]:
+    if total <= 0 or not source_keys:
+        raise ValueError("Weighted source selection requires a positive total and sources")
+    if set(weights) != set(source_keys):
+        raise ValueError("Training source weights must match the configured source keys")
+    values = [float(weights[key]) for key in source_keys]
+    if any(not math.isfinite(value) or value <= 0.0 for value in values):
+        raise ValueError("Training source weights must be finite and positive")
+    weight_sum = sum(values)
+    quotas = [total * value / weight_sum for value in values]
+    counts = [math.floor(quota) for quota in quotas]
+    remaining = total - sum(counts)
+    order = sorted(
+        range(len(source_keys)),
+        key=lambda index: (-(quotas[index] - counts[index]), index),
+    )
+    for index in order[:remaining]:
+        counts[index] += 1
+    return dict(zip(source_keys, counts))
+
+
+def prepare(
+    config_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
     config = load_yaml(config_path)
+    tasks = _enabled_tasks(config)
     counts = config["counts"]
     seed = int(config["split_seed"])
-    output_dir = Path(config["output_dir"])
+    output_dir = Path(output_dir) if output_dir is not None else Path(config["output_dir"])
     manifest_path = output_dir / "splits.json"
     entries: list[dict[str, Any]] = []
     stable_id_splits: dict[str, set[str]] = {}
     content_hash_splits: dict[str, set[str]] = {}
     configured_overlap_pairs = config.get("allowed_cross_stage_reuse", [])
     allowed_overlap_pairs = normalize_stage_overlap_pairs(configured_overlap_pairs)
-    report: dict[str, Any] = {"tasks": {}, "counts": counts}
+    report: dict[str, Any] = {
+        "enabled_tasks": list(tasks),
+        "tasks": {},
+        "counts": counts,
+    }
+    if run_id is not None:
+        report["run_id"] = run_id
     discovery_sources = config["discovery_sources"]
 
-    for task, source_key in TASK_TO_SOURCE.items():
+    for task in tasks:
+        source_key = TASK_TO_SOURCE[task]
         source = config["sources"][source_key]
         dataset_name = str(source["dataset_name"])
         training_source_keys = tuple(
@@ -339,16 +393,47 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
                 "count": len(pool_rows),
                 "official_splits": sorted({split for _, _, split, _, _ in pool_rows}),
             }
-            _append_assignments(
-                entries=entries,
-                stable_id_splits=stable_id_splits,
-                content_hash_splits=content_hash_splits,
-                allowed_overlap_pairs=allowed_overlap_pairs,
-                rows=pool_rows,
-                assignments=((assigned_split, count),),
-                task=task,
-                seed=seed,
-            )
+            if assigned_split == "stage3_adapter_train" and config.get("training_source_weights", {}).get(task):
+                source_keys = tuple(training_source_keys)
+                source_counts = _weighted_counts(
+                    count,
+                    source_keys,
+                    config["training_source_weights"][task],
+                )
+                for source_key in source_keys:
+                    source = config["sources"].get(source_key)
+                    if source is None:
+                        raise ValueError(f"{task} source key {source_key!r} is not configured in sources")
+                    source_rows = _ordered_unique_pool(
+                        config,
+                        task=task,
+                        dataset_name=str(source["dataset_name"]),
+                        seed=seed,
+                        section_names=("sources",),
+                    )
+                    _append_assignments(
+                        entries=entries,
+                        stable_id_splits=stable_id_splits,
+                        content_hash_splits=content_hash_splits,
+                        allowed_overlap_pairs=allowed_overlap_pairs,
+                        rows=source_rows,
+                        assignments=((assigned_split, source_counts[source_key]),),
+                        task=task,
+                        seed=seed,
+                        run_id=run_id,
+                    )
+            else:
+                _append_assignments(
+                    entries=entries,
+                    stable_id_splits=stable_id_splits,
+                    content_hash_splits=content_hash_splits,
+                    allowed_overlap_pairs=allowed_overlap_pairs,
+                    rows=pool_rows,
+                    assignments=((assigned_split, count),),
+                    task=task,
+                    seed=seed,
+                    run_id=run_id,
+                )
 
         evaluation_count = task_split_count(
             config,
@@ -375,6 +460,7 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
             assignments=(("stage4_final_eval", evaluation_count),),
             task=task,
             seed=seed,
+            run_id=run_id,
         )
         report["tasks"][task] = {
             "pool_available_by_stage": pool_available_by_stage,
@@ -387,6 +473,8 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
         }
 
     for task, source_counts in discovery_sources.items():
+        if task not in tasks:
+            continue
         primary_source = TASK_TO_SOURCE[task]
         for source_key, requested_count in source_counts.items():
             if source_key == primary_source:
@@ -414,6 +502,7 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
                 assignments=(("stage2_discovery", count),),
                 task=task,
                 seed=seed,
+                run_id=run_id,
             )
 
     entries.sort(key=lambda row: (row["task"], row["assigned_split"], row["split_key"]))
@@ -447,11 +536,20 @@ def prepare(config_path: str | Path) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/data.yaml")
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--run-id", default=None)
     return parser.parse_args()
 
 
 def main() -> None:
-    print(json.dumps(prepare(parse_args().config), ensure_ascii=False, indent=2))
+    args = parse_args()
+    print(
+        json.dumps(
+            prepare(args.config, output_dir=args.output_dir, run_id=args.run_id),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -14,9 +14,6 @@ from src.data.format_tasks import PromptOnlyExample
 from src.formal.task_banks import TaskBank
 
 
-FORMAL_TASKS = ("math", "multihop", "code")
-
-
 def _collate_prompt_examples(
     examples: Sequence[PromptOnlyExample],
     *,
@@ -95,8 +92,9 @@ def train_formal_probe(
     checkpoint_manifest_sha256: str,
     data_manifest_sha256: str,
 ) -> dict[str, Any]:
-    if set(banks) != set(FORMAL_TASKS):
-        raise ValueError("Formal Probe requires all three task banks")
+    tasks = tuple(banks)
+    if len(tasks) < 2:
+        raise ValueError("Formal Probe requires at least two task banks")
     for key in (
         "discard_hidden_after_routing",
         "discard_kv_cache_after_routing",
@@ -109,9 +107,11 @@ def train_formal_probe(
     torch.manual_seed(seed)
     batch_size = int(config.get("batch_size", 32))
     feature_batch_size = int(config.get("feature_batch_size", 1))
+    if config.get("labels") != list(tasks) or int(config.get("num_classes", 0)) != len(tasks):
+        raise ValueError("Formal Probe config does not match the active task banks")
     train_features, train_targets = extract_formal_probe_features(
         model,
-        bank=banks["math"],
+        bank=banks[tasks[0]],
         examples=train_examples,
         labels=train_labels,
         tokenizer=tokenizer,
@@ -120,7 +120,7 @@ def train_formal_probe(
     )
     validation_features, validation_targets = extract_formal_probe_features(
         model,
-        bank=banks["math"],
+        bank=banks[tasks[0]],
         examples=validation_examples,
         labels=validation_labels,
         tokenizer=tokenizer,
@@ -130,12 +130,12 @@ def train_formal_probe(
     hidden_size = int(train_features.shape[1])
     if validation_features.shape[1] != hidden_size:
         raise ValueError("Formal Probe feature widths differ")
-    if set(train_targets.tolist()) != set(range(3)):
-        raise ValueError("Formal Probe training data must cover all three labels")
-    if set(validation_targets.tolist()) != set(range(3)):
-        raise ValueError("Formal Probe validation data must cover all three labels")
+    if set(train_targets.tolist()) != set(range(len(tasks))):
+        raise ValueError("Formal Probe training data must cover all configured labels")
+    if set(validation_targets.tolist()) != set(range(len(tasks))):
+        raise ValueError("Formal Probe validation data must cover all configured labels")
 
-    head = torch.nn.Linear(hidden_size, 3).to(device)
+    head = torch.nn.Linear(hidden_size, len(tasks)).to(device)
     optimizer = torch.optim.AdamW(
         head.parameters(),
         lr=float(config.get("learning_rate", 1.0e-3)),
@@ -187,8 +187,12 @@ def train_formal_probe(
         "status": "PASS",
         "checkpoint_manifest_sha256": checkpoint_manifest_sha256,
         "data_manifest_sha256": data_manifest_sha256,
-        "class_mapping": {str(index): task for index, task in enumerate(FORMAL_TASKS)},
-        "routing_rule": "argmax_three_way",
+        "class_mapping": {str(index): task for index, task in enumerate(tasks)},
+        "routing_rule": (
+            "argmax_two_way" if len(tasks) == 2
+            else "argmax_three_way" if len(tasks) == 3
+            else f"argmax_{len(tasks)}_way"
+        ),
         "head_file": head_path.name,
         "head_sha256": _file_sha256(head_path),
         "hidden_size": hidden_size,
@@ -231,21 +235,23 @@ def load_formal_probe_head(
     expected_checkpoint_manifest_sha256: str,
     expected_data_manifest_sha256: str | None = None,
     expected_partition_sha256_per_task: dict[str, str] | None = None,
+    enabled_tasks: tuple[str, ...] | None = None,
 ) -> torch.nn.Linear:
     manifest = load_formal_probe_manifest(
         output_dir,
         expected_checkpoint_manifest_sha256=expected_checkpoint_manifest_sha256,
         expected_data_manifest_sha256=expected_data_manifest_sha256,
         expected_partition_sha256_per_task=expected_partition_sha256_per_task,
+        enabled_tasks=enabled_tasks,
     )
     root = Path(output_dir)
     head_path = root / manifest["head_file"]
     if _file_sha256(head_path) != manifest["head_sha256"]:
-        raise ValueError("Formal Probe head hash mismatch")
+        raise ValueError("STALE_CHECKPOINT_MISMATCH: formal Probe head hash mismatch")
     if int(manifest.get("hidden_size", -1)) != hidden_size:
-        raise ValueError("Formal Probe hidden size mismatch")
+        raise ValueError("MODEL_IDENTITY_MISMATCH: formal Probe hidden size mismatch")
     state = load_file(head_path, device="cpu")
-    head = torch.nn.Linear(hidden_size, 3)
+    head = torch.nn.Linear(hidden_size, len(manifest["class_mapping"]))
     head.load_state_dict(state, strict=True)
     return head
 
@@ -256,20 +262,34 @@ def load_formal_probe_manifest(
     expected_checkpoint_manifest_sha256: str,
     expected_data_manifest_sha256: str | None = None,
     expected_partition_sha256_per_task: dict[str, str] | None = None,
+    enabled_tasks: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Load and validate the complete formal Probe provenance record."""
     root = Path(output_dir)
-    manifest = json.loads((root / "probe_manifest.json").read_text(encoding="utf-8"))
+    manifest_path = root / "probe_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"STALE_CHECKPOINT_MISMATCH: formal Probe manifest is missing: {manifest_path}"
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("status") != "PASS":
-        raise ValueError("Formal Probe manifest is missing a passing status")
+        raise ValueError("STALE_CHECKPOINT_MISMATCH: formal Probe manifest is missing a passing status")
     if manifest.get("checkpoint_manifest_sha256") != expected_checkpoint_manifest_sha256:
-        raise ValueError("Formal Probe checkpoint identity mismatch")
+        raise ValueError("STALE_CHECKPOINT_MISMATCH: formal Probe checkpoint identity mismatch")
     if expected_data_manifest_sha256 is not None and manifest.get("data_manifest_sha256") != expected_data_manifest_sha256:
-        raise ValueError("Formal Probe data manifest identity mismatch")
-    if manifest.get("class_mapping") != {"0": "math", "1": "multihop", "2": "code"}:
-        raise ValueError("Formal Probe class mapping is not the formal three-way mapping")
-    if manifest.get("routing_rule") != "argmax_three_way":
-        raise ValueError("Formal Probe routing rule mismatch")
+        raise ValueError("STALE_CHECKPOINT_MISMATCH: formal Probe data manifest identity mismatch")
+    mapping = manifest.get("class_mapping", {})
+    tasks = tuple(enabled_tasks or (mapping[str(index)] for index in range(len(mapping))))
+    expected_mapping = {str(index): task for index, task in enumerate(tasks)}
+    if mapping != expected_mapping:
+        raise ValueError("TASK_ORDER_MISMATCH: formal Probe class mapping does not match enabled tasks")
+    routing_rule = (
+        "argmax_two_way" if len(tasks) == 2
+        else "argmax_three_way" if len(tasks) == 3
+        else f"argmax_{len(tasks)}_way"
+    )
+    if manifest.get("routing_rule") != routing_rule:
+        raise ValueError("TASK_ORDER_MISMATCH: formal Probe routing rule mismatch")
     if any("fixed" in str(key).lower() for key in manifest):
         raise ValueError("Formal Probe manifest contains a Fixed entry")
     for key in (
@@ -282,5 +302,5 @@ def load_formal_probe_manifest(
     if expected_partition_sha256_per_task is not None:
         actual = manifest.get("partition_sha256_per_task")
         if actual != expected_partition_sha256_per_task:
-            raise ValueError("Formal Probe partition provenance mismatch")
+            raise ValueError("STALE_PARTITION_MISMATCH: formal Probe partition provenance mismatch")
     return manifest

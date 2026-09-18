@@ -10,9 +10,6 @@ from src.formal.runtime import parameter_hash, task_routing_parameter_names
 from src.formal.task_banks import TaskBank
 
 
-FORMAL_TASKS = ("math", "multihop", "code")
-
-
 @dataclass(frozen=True)
 class FormalProbePrediction:
     predicted_task: str
@@ -32,7 +29,7 @@ class FormalInferenceResult:
 
 
 class FormalInferenceEngine:
-    """Three-way Probe plus atomic task-bank routing for a formal checkpoint."""
+    """Config-sized Probe plus atomic task-bank routing for a formal checkpoint."""
 
     def __init__(
         self,
@@ -41,19 +38,22 @@ class FormalInferenceEngine:
         banks: dict[str, TaskBank],
         probe_head: torch.nn.Linear,
         device: torch.device,
-        probe_task: str = "math",
+        probe_task: str | None = None,
     ) -> None:
-        if set(banks) != set(FORMAL_TASKS):
-            raise ValueError("Formal inference requires math, multihop, and code banks")
+        tasks = tuple(banks)
+        if len(tasks) < 2:
+            raise ValueError("Formal inference requires at least two task banks")
+        probe_task = probe_task or next(iter(banks))
         if probe_task not in banks:
             raise ValueError(f"Unknown formal Probe task: {probe_task}")
-        if probe_head.out_features != len(FORMAL_TASKS):
-            raise ValueError("Formal Probe head must be three-way")
+        if probe_head.out_features != len(tasks):
+            raise ValueError("Formal Probe head size must match enabled tasks")
         model_config = model.module.config if hasattr(model, "module") else model.config
         if probe_head.in_features != int(model_config.hidden_size):
             raise ValueError("Formal Probe head width must come from the model config")
         self.model = model
         self.banks = banks
+        self.tasks = tasks
         self.probe_head = probe_head.to(device).eval()
         self.device = device
         self.probe_task = probe_task
@@ -117,7 +117,7 @@ class FormalInferenceEngine:
         probabilities = torch.softmax(logits, dim=-1)
         index = int(logits.argmax(dim=-1).item())
         prediction = FormalProbePrediction(
-            predicted_task=FORMAL_TASKS[index],
+            predicted_task=self.tasks[index],
             logits=tuple(float(value) for value in logits[0].cpu()),
             probabilities=tuple(float(value) for value in probabilities[0].cpu()),
         )

@@ -44,6 +44,7 @@ def require_defined_residual_cost(config: dict[str, Any]) -> None:
 
 
 def formal_discovery_status(config: dict[str, Any]) -> dict[str, object]:
+    cka = config.get("method") == "linear_cka_min"
     return {
         "model_mode": "original_residual_only",
         "attnres_accessed": False,
@@ -52,9 +53,12 @@ def formal_discovery_status(config: dict[str, Any]) -> dict[str, object]:
         "backward_used": False,
         "true_moirai_replay": False,
         "cost_status": (
-            "DEFINED" if bool(config.get("ordinary_residual_cost_defined", False))
+            "DEFINED" if cka or bool(config.get("ordinary_residual_cost_defined", False))
             else RESIDUAL_DISCOVERY_COST_UNDEFINED
         ),
+        "method": config.get("method", "legacy_cosine"),
+        "metric": config.get("metric") if cka else "legacy_cosine",
+        "interval_reduction": config.get("interval_reduction") if cka else None,
     }
 
 

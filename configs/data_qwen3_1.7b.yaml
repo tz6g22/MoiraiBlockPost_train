@@ -1,15 +1,18 @@
 tokenizer:
-  name_or_path: outputs/base/qwen3_14b_full_attnres
+  name_or_path: artifacts/models/Qwen3-1.7B
   local_files_only: true
 
 split_seed: 42
 split_key_prefix: "moiraiblock-post-seed42::"
-output_dir: outputs/data
+output_dir: outputs/formal/qwen3_1.7b/runs/qwen3_1_7b_linear_cka_min_seed42/data
+enabled_tasks:
+  - math
+  - multihop
 
 counts:
   stage2_discovery:
-    math: 1000
-    multihop: 1000
+    math: 200
+    multihop: 200
     code: 500
   stage3_adapter_train: 1000
   stage3_adapter_val: 500
@@ -208,10 +211,15 @@ sources:
 
 discovery_sources:
   math:
-    gsm8k: 500
-    svamp: 500
+    svamp: 50
+    gsm8k: 50
+    math_train: 50
+    openmathinstruct2: 50
   multihop:
-    clutrr: 1000
+    clutrr: 50
+    musique: 50
+    hotpotqa: 50
+    2wikimultihopqa: 50
   code:
     mbpp: 374
     xcoder_80k: 126
@@ -221,13 +229,20 @@ training_sources:
   # disjoint from Discovery through the global assignment audit.
   math:
     - gsm8k
-    - svamp
   multihop:
     - clutrr
-    - hotpotqa
   code:
     - mbpp
     - xcoder_80k
+
+training_source_weights:
+  math:
+    gsm8k: 1.0
+  multihop:
+    clutrr: 1.0
+  code:
+    mbpp: 0.5
+    xcoder_80k: 0.5
 
 validation_sources:
   multihop:

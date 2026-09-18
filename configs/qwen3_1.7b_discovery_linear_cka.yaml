@@ -1,0 +1,32 @@
+seed: 42
+model_mode: original_residual_only
+formal_discovery: true
+ordinary_residual_cost_defined: true
+discovery_metric: linear_cka
+cka_interval_reduction: mean
+base_checkpoint: artifacts/models/Qwen3-1.7B
+data_manifest: outputs/data/qwen3_1.7b/splits.json
+data_config: configs/data_qwen3_1.7b.yaml
+tasks:
+  - math
+  - multihop
+discovery_cases_per_task:
+  math: 200
+  multihop: 200
+merge_cost_threshold: null
+similarity_thresholds:
+  - 0.1
+  - 0.2
+  - 0.3
+  - 0.4
+  - 0.5
+  - 0.6
+  - 0.7
+  - 0.8
+  - 0.9
+min_block_length: 1
+max_block_length: null
+no_adjacent_singletons: false
+discovery_processes_per_node: 1
+discovery_master_port: 29529
+output_dir: outputs/formal/qwen3_1.7b/discovery_linear_cka

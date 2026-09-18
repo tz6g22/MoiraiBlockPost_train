@@ -9,7 +9,6 @@ from src.data.format_tasks import (
     canonical_stable_id,
 )
 
-FORMAL_TASKS = ("math", "multihop", "code")
 FORMAL_STAGES = (
     "stage2_discovery",
     "stage3_adapter_train",
@@ -35,8 +34,10 @@ def stage_source_sections(
             for source in data_config.get("validation_sources", {}).values()
         )
         return ("validation_sources",) if has_validation_source else ("sources",)
-    if stage in {"probe_train", "probe_val"}:
+    if stage == "probe_train":
         return ("probe_sources", "sources")
+    if stage == "probe_val":
+        return ("probe_sources", "validation_sources", "sources")
     return ("sources",)
 
 
@@ -88,8 +89,10 @@ def audit_formal_source_provenance(
     records: list[dict[str, Any]],
     *,
     data_config: dict[str, Any],
+    enabled_tasks: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Reject records whose assigned stage uses the wrong configured source."""
+    tasks = tuple(enabled_tasks or TASK_TO_SOURCE)
     configured: dict[str, set[tuple[str, str, str]]] = {}
     for section_name in (
         "sources",
@@ -111,7 +114,9 @@ def audit_formal_source_provenance(
     for record in records:
         task = str(record.get("task", ""))
         stage = str(record.get("assigned_split", ""))
-        if task not in FORMAL_TASKS:
+        if task not in tasks:
+            if task in TASK_TO_SOURCE:
+                continue
             raise RuntimeError("Formal data manifest contains an unknown task")
         if stage not in FORMAL_STAGES:
             raise RuntimeError(

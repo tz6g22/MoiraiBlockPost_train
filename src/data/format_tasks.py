@@ -121,25 +121,50 @@ def format_clutrr_prompt(
 
 
 def _hotpotqa_context_text(context: Any) -> str:
-    if not isinstance(context, dict):
-        raise ValueError("HotpotQA context must be a mapping")
-    titles = context.get("title")
-    sentences = context.get("sentences")
-    if not isinstance(titles, (list, tuple)) or not isinstance(
-        sentences, (list, tuple)
-    ):
-        raise ValueError("HotpotQA context requires title and sentences lists")
-    if len(titles) != len(sentences):
-        raise ValueError("HotpotQA context title/sentence lengths differ")
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Serialized multi-hop context is not valid JSON") from exc
+
     passages: list[str] = []
-    for title, paragraph in zip(titles, sentences):
-        if not isinstance(paragraph, (list, tuple)):
-            raise ValueError("HotpotQA context sentences must be nested lists")
-        text = " ".join(str(sentence).strip() for sentence in paragraph).strip()
-        if text:
+    if isinstance(context, dict):
+        titles = context.get("title")
+        sentences = context.get("sentences")
+        if not isinstance(titles, (list, tuple)) or not isinstance(
+            sentences, (list, tuple)
+        ):
+            raise ValueError("HotpotQA context requires title and sentences lists")
+        if len(titles) != len(sentences):
+            raise ValueError("HotpotQA context title/sentence lengths differ")
+        for title, paragraph in zip(titles, sentences):
+            if not isinstance(paragraph, (list, tuple)):
+                raise ValueError("HotpotQA context sentences must be nested lists")
+            text = " ".join(str(sentence).strip() for sentence in paragraph).strip()
+            if text:
+                passages.append(f"{str(title).strip()}: {text}")
+    elif isinstance(context, (list, tuple)):
+        for paragraph in context:
+            if isinstance(paragraph, dict):
+                title = paragraph.get("title")
+                value = paragraph.get("paragraph_text", paragraph.get("text"))
+                if value is None:
+                    value = paragraph.get("sentences")
+            elif isinstance(paragraph, (list, tuple)) and len(paragraph) == 2:
+                title, value = paragraph
+            else:
+                raise ValueError("Multi-hop context paragraph has an unsupported shape")
+            if isinstance(value, (list, tuple)):
+                text = " ".join(str(sentence).strip() for sentence in value).strip()
+            else:
+                text = str(value).strip()
+            if title is None or not text:
+                raise ValueError("Multi-hop context paragraph is missing title or text")
             passages.append(f"{str(title).strip()}: {text}")
+    else:
+        raise ValueError("Multi-hop context must be a mapping, sequence, or JSON string")
     if not passages:
-        raise ValueError("HotpotQA context must contain non-empty passages")
+        raise ValueError("Multi-hop context must contain non-empty passages")
     return "\n".join(passages)
 
 
@@ -155,6 +180,33 @@ def format_hotpotqa_prompt(
     if not question:
         raise ValueError("HotpotQA row requires a non-empty question")
     return f"Context:\n{context}\nQuestion: {question}\nAnswer:"
+
+
+def _format_xcoder_messages(messages: Any) -> tuple[str, str]:
+    if not isinstance(messages, (list, tuple)):
+        raise ValueError("XCoder messages must be a sequence")
+    normalized: list[tuple[str, str]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ValueError("XCoder message must be a mapping")
+        role = str(message.get("role", "")).strip().lower()
+        content = str(message.get("content", "")).strip()
+        if role not in {"user", "assistant", "system"} or not content:
+            raise ValueError("XCoder message requires a supported role and content")
+        normalized.append((role, content))
+    assistant_indices = [
+        index for index, (role, _content) in enumerate(normalized) if role == "assistant"
+    ]
+    if not assistant_indices:
+        raise ValueError("XCoder example has no reference assistant solution")
+    target_index = assistant_indices[-1]
+    prompt = "\n".join(
+        f"{role.capitalize()}: {content}"
+        for role, content in normalized[:target_index]
+    ).strip()
+    if not prompt:
+        raise ValueError("XCoder example has no prompt before the reference solution")
+    return f"{prompt}\nAssistant:", normalized[target_index][1]
 
 
 TASK_TO_SOURCE = {
@@ -194,6 +246,11 @@ def format_task_prompt(
             return format_hotpotqa_prompt(row, field_mapping)
         return format_clutrr_prompt(row, field_mapping)
     if task == "code":
+        if "messages" in field_mapping:
+            prompt, _target = _format_xcoder_messages(
+                nested_value(row, str(field_mapping["messages"]))
+            )
+            return prompt
         prompt = str(nested_value(row, str(field_mapping["prompt"]))).strip()
         if not prompt:
             raise ValueError("MBPP row requires a non-empty prompt")
@@ -208,6 +265,10 @@ def format_task_target(
 ) -> str:
     if task == "math":
         target = str(nested_value(row, str(field_mapping["target"]))).strip()
+    elif task == "code" and "messages" in field_mapping:
+        _prompt, target = _format_xcoder_messages(
+            nested_value(row, str(field_mapping["messages"]))
+        )
     elif task in {"multihop", "code"}:
         target = str(nested_value(row, str(field_mapping["target"]))).strip()
     else:
@@ -235,10 +296,35 @@ def canonical_content_sha256(
             "context": nested_value(row, str(field_mapping["context"])),
             "target": nested_value(row, str(field_mapping["target"])),
         }
-    elif dataset_name in {"gsm8k", "svamp"}:
+    elif dataset_name in {"gsm8k", "svamp", "math"}:
         payload = {
             "question": nested_value(row, str(field_mapping["question"])),
             "target": nested_value(row, str(field_mapping["target"])),
+        }
+    elif dataset_name == "openmathinstruct2":
+        payload = {
+            "question": nested_value(row, str(field_mapping["question"])),
+            "target": nested_value(row, str(field_mapping["target"])),
+            "expected_answer": nested_value(
+                row,
+                str(field_mapping["answer"]),
+            ),
+        }
+    elif dataset_name == "musique":
+        payload = {
+            "question": nested_value(row, str(field_mapping["question"])),
+            "context": nested_value(row, str(field_mapping["context"])),
+            "target": nested_value(row, str(field_mapping["target"])),
+        }
+    elif dataset_name == "2wikimultihopqa":
+        payload = {
+            "question": nested_value(row, str(field_mapping["question"])),
+            "context": nested_value(row, str(field_mapping["context"])),
+            "target": nested_value(row, str(field_mapping["target"])),
+        }
+    elif dataset_name == "xcoder_80k":
+        payload = {
+            "messages": nested_value(row, str(field_mapping["messages"])),
         }
     elif dataset_name == "mbpp":
         payload = {

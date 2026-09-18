@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from collections import Counter
 from pathlib import Path
@@ -26,13 +27,8 @@ from src.data.source_provenance import (
     validate_manifest_row_identity,
 )
 from src.discovery.dynamic_programming import (
-    count_feasible_partitions,
     solve_partition,
     valid_interval_mask,
-)
-from src.discovery.fixed_policy import (
-    FIXED_BLOCK_COUNT_POLICY,
-    resolve_fixed_num_blocks,
 )
 from src.discovery.ordinary_residual import (
     OrdinaryResidualReference,
@@ -55,6 +51,9 @@ COST_METHOD = "ordinary_residual_pairwise_directional_v1"
 
 
 def validate_discovery_config(config: dict[str, Any]) -> None:
+    discovery_metric = str(config.get("discovery_metric", "cosine_residual"))
+    if discovery_metric not in {"cosine_residual", "linear_cka"}:
+        raise ValueError(f"Unsupported discovery_metric: {discovery_metric}")
     tasks = config.get("tasks")
     if (
         not isinstance(tasks, list)
@@ -67,43 +66,64 @@ def validate_discovery_config(config: dict[str, Any]) -> None:
         raise ValueError("Discovery must run in original_residual_only mode")
     if config.get("formal_discovery") is not True:
         raise ValueError("Formal Discovery must be explicitly enabled")
-    if config.get("ordinary_residual_cost_defined") is not True:
-        raise RuntimeError("RESIDUAL_DISCOVERY_COST_UNDEFINED")
-    fixed_block_size = config.get("fixed_block_size")
-    if not isinstance(fixed_block_size, int) or fixed_block_size <= 0:
-        raise ValueError("fixed_block_size must be a positive integer")
-    if config.get("num_blocks_policy") != FIXED_BLOCK_COUNT_POLICY:
-        raise ValueError(
-            "Discovery must use num_blocks_policy="
-            f"{FIXED_BLOCK_COUNT_POLICY!r}"
-        )
+    if discovery_metric == "linear_cka":
+        if config.get("ordinary_residual_only") is not True:
+            raise RuntimeError("Linear CKA Discovery must use ordinary residuals only")
+        if config.get("cka_interval_reduction") != "min":
+            raise ValueError("Formal Linear CKA must use min interval reduction")
+        task_thresholds = config.get("task_similarity_thresholds")
+        if not isinstance(task_thresholds, dict) or set(task_thresholds) != set(tasks):
+            raise ValueError("Linear CKA thresholds must cover every task")
+        for task, value in task_thresholds.items():
+            if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"Invalid Linear CKA threshold for {task}")
+    else:
+        if config.get("ordinary_residual_cost_defined") is not True:
+            raise RuntimeError("RESIDUAL_DISCOVERY_COST_UNDEFINED")
+        if "merge_cost_threshold" not in config:
+            raise ValueError("Discovery config must declare merge_cost_threshold")
+        threshold = config.get("merge_cost_threshold")
+        if threshold is not None and (
+            not isinstance(threshold, (int, float))
+            or not math.isfinite(float(threshold))
+            or float(threshold) < 0
+        ):
+            raise ValueError("merge_cost_threshold must be null or finite and non-negative")
 
     case_counts = config.get("discovery_cases_per_task")
     if (
         not isinstance(case_counts, dict)
-        or set(case_counts) != set(EXPECTED_TASKS)
+        or set(case_counts) != set(tasks)
         or any(int(value) <= 0 for value in case_counts.values())
     ):
         raise ValueError(
             "discovery_cases_per_task must give a positive count for "
-            f"{', '.join(EXPECTED_TASKS)}"
+            f"{', '.join(tasks)}"
         )
     min_length = config.get("min_block_length")
     max_length = config.get("max_block_length")
-    if (
-        not isinstance(min_length, int)
-        or not isinstance(max_length, int)
-        or min_length <= 0
-        or max_length < min_length
+    if not isinstance(min_length, int) or min_length != 1:
+        raise ValueError("Discovery must allow singleton blocks with min_block_length=1")
+    if max_length is not None and (
+        not isinstance(max_length, int) or max_length < min_length
     ):
-        raise ValueError(
-            "min_block_length/max_block_length must define a positive inclusive range"
-        )
-    if config.get("no_adjacent_singletons") is not True:
-        raise ValueError("Discovery must enforce no_adjacent_singletons")
+        raise ValueError("max_block_length must be null or an inclusive range maximum")
+    if config.get("no_adjacent_singletons", False) is True:
+        raise ValueError("Discovery must allow adjacent singleton blocks")
     for key in ("base_checkpoint", "data_manifest", "data_config", "output_dir"):
         if key not in config:
             raise ValueError(f"Discovery config is missing {key}")
+
+
+def require_defined_merge_threshold(config: dict[str, Any]) -> float:
+    threshold = config.get("merge_cost_threshold")
+    if threshold is None:
+        raise RuntimeError("MERGE_THRESHOLD_UNDEFINED")
+    if not isinstance(threshold, (int, float)) or not math.isfinite(float(threshold)):
+        raise ValueError("merge_cost_threshold must be finite")
+    if float(threshold) < 0:
+        raise ValueError("merge_cost_threshold must be non-negative")
+    return float(threshold)
 
 
 def _weight_hash(checkpoint: Path) -> str:
@@ -117,7 +137,7 @@ def _resolve_checkpoint_path(raw: str) -> Path:
     resolved = os.path.expandvars(str(raw))
     if "$" in resolved:
         raise RuntimeError(
-            "Original Qwen3 checkpoint path is unresolved; set QWEN3_14B_PATH"
+            "Original Qwen3 checkpoint path is unresolved; set the configured Qwen3 path"
         )
     return Path(resolved)
 
@@ -447,9 +467,8 @@ def _finish_task_discovery(
     checkpoint_hash: str,
     data_manifest_sha256: str,
     cost_mean: np.ndarray,
-    num_moirai_blocks: int,
+    merge_cost_threshold: float,
     candidate_block_lengths: list[int],
-    no_adjacent_singletons: bool,
     source_counts: dict[str, int],
 ) -> dict[str, Any]:
     stable_ids_hash = hashlib.sha256(
@@ -457,10 +476,9 @@ def _finish_task_discovery(
     ).hexdigest()
     selected = solve_partition(
         cost_mean,
-        num_blocks=num_moirai_blocks,
+        merge_cost_threshold=merge_cost_threshold,
         task=task,
         candidate_lengths=candidate_block_lengths,
-        no_adjacent_singletons=no_adjacent_singletons,
     )
     partition_payload = selected.partition.to_dict()
     partition_payload.update(
@@ -468,6 +486,7 @@ def _finish_task_discovery(
             "discovery_checkpoint_sha256": checkpoint_hash,
             "data_manifest_sha256": data_manifest_sha256,
             "cost_method": COST_METHOD,
+            "merge_cost_threshold": merge_cost_threshold,
         }
     )
     _write_json(output_dir / "partition.json", partition_payload)
@@ -480,7 +499,8 @@ def _finish_task_discovery(
         "discovery_source_counts": source_counts,
         "discovery_stable_ids_sha256": stable_ids_hash,
         "candidate_block_lengths": candidate_block_lengths,
-        "num_moirai_blocks": num_moirai_blocks,
+        "merge_cost_threshold": merge_cost_threshold,
+        "num_moirai_blocks": len(selected.partition.blocks),
         "final_partition": selected.partition.to_dict(),
         "final_dp_cost": float(selected.cost),
     }
@@ -512,9 +532,8 @@ def run_task_discovery(
     checkpoint_hash: str,
     data_manifest_sha256: str,
     num_transformer_blocks: int,
-    num_moirai_blocks: int,
+    merge_cost_threshold: float,
     candidate_block_lengths: list[int],
-    no_adjacent_singletons: bool,
     resume: bool = False,
 ) -> dict[str, Any]:
     if not dist.is_initialized() or dist.get_rank() == 0:
@@ -600,9 +619,8 @@ def run_task_discovery(
         checkpoint_hash=checkpoint_hash,
         data_manifest_sha256=data_manifest_sha256,
         cost_mean=cost_mean,
-        num_moirai_blocks=num_moirai_blocks,
+        merge_cost_threshold=merge_cost_threshold,
         candidate_block_lengths=candidate_block_lengths,
-        no_adjacent_singletons=no_adjacent_singletons,
         source_counts=source_counts,
     )
 
@@ -631,35 +649,43 @@ def _validate_resume_outputs(
     result_path: Path,
     checkpoint_hash: str,
     data_manifest_sha256: str,
-    num_moirai_blocks: int,
+    merge_cost_threshold: float,
 ) -> None:
     partition = MoiraiPartition.from_json(partition_path)
     partition_payload = json.loads(partition_path.read_text(encoding="utf-8"))
     result = json.loads(result_path.read_text(encoding="utf-8"))
     if partition.task != task or result.get("task") != task:
-        raise ValueError(f"Discovery resume task mismatch for {task}")
+        raise ValueError(f"STALE_PARTITION_MISMATCH: Discovery resume task mismatch for {task}")
     if result.get("cost_method") != COST_METHOD or partition_payload.get("cost_method") != COST_METHOD:
-        raise ValueError("Discovery resume cost method mismatch")
+        raise ValueError("STALE_PARTITION_MISMATCH: Discovery resume cost method mismatch")
     if partition_payload.get("discovery_checkpoint_sha256") != checkpoint_hash:
-        raise ValueError(f"Discovery resume checkpoint hash mismatch for {task}")
+        raise ValueError(f"MODEL_IDENTITY_MISMATCH: Discovery resume checkpoint hash mismatch for {task}")
     if partition_payload.get("data_manifest_sha256") != data_manifest_sha256:
-        raise ValueError(f"Discovery resume data manifest hash mismatch for {task}")
+        raise ValueError(f"STALE_PARTITION_MISMATCH: Discovery resume data manifest hash mismatch for {task}")
     if result.get("data_manifest_sha256") != data_manifest_sha256:
-        raise ValueError(f"Discovery resume data manifest hash mismatch for {task}")
-    if int(result.get("num_moirai_blocks", -1)) != num_moirai_blocks:
-        raise ValueError(f"Discovery resume N differs from configuration for {task}")
+        raise ValueError(f"STALE_PARTITION_MISMATCH: Discovery resume data manifest hash mismatch for {task}")
+    if float(result.get("merge_cost_threshold", float("nan"))) != merge_cost_threshold:
+        raise ValueError(f"STALE_PARTITION_MISMATCH: Discovery resume merge threshold mismatch for {task}")
+    if float(partition_payload.get("merge_cost_threshold", float("nan"))) != merge_cost_threshold:
+        raise ValueError(f"STALE_PARTITION_MISMATCH: Discovery partition merge threshold mismatch for {task}")
     final_payload = result.get("final_partition")
     if not isinstance(final_payload, dict):
-        raise ValueError("Discovery resume final partition is missing")
+        raise ValueError("STALE_PARTITION_MISMATCH: Discovery resume final partition is missing")
     if MoiraiPartition.from_dict(final_payload).sha256 != partition.sha256:
-        raise ValueError("Discovery resume final partition disagrees")
+        raise ValueError("STALE_PARTITION_MISMATCH: Discovery resume final partition disagrees")
 
 
 def main() -> None:
     args = parse_args()
     config = load_yaml(args.config)
-    require_defined_residual_cost(config)
     validate_discovery_config(config)
+    if str(config.get("discovery_metric", "cosine_residual")) == "linear_cka":
+        from src.discovery.linear_cka import run_linear_cka_discovery
+
+        run_linear_cka_discovery(config, args)
+        return
+    require_defined_residual_cost(config)
+    merge_cost_threshold = require_defined_merge_threshold(config)
     context = init_distributed()
     checkpoint = _resolve_checkpoint_path(args.checkpoint or config["base_checkpoint"])
     checkpoint_manifest, checkpoint_hash = broadcast_object(
@@ -667,23 +693,12 @@ def main() -> None:
         context,
     )
     model_num_layers = int(checkpoint_manifest["num_hidden_layers"])
-    num_moirai_blocks = resolve_fixed_num_blocks(
-        model_num_layers,
-        fixed_block_size=int(config["fixed_block_size"]),
-        policy=str(config["num_blocks_policy"]),
-    )
+    max_length = config.get("max_block_length")
     candidate_block_lengths = list(
         range(
             int(config["min_block_length"]),
-            int(config["max_block_length"]) + 1,
+            (int(max_length) if max_length is not None else model_num_layers) + 1,
         )
-    )
-    no_adjacent_singletons = bool(config["no_adjacent_singletons"])
-    feasible_partition_count = count_feasible_partitions(
-        model_num_layers,
-        num_blocks=num_moirai_blocks,
-        candidate_lengths=candidate_block_lengths,
-        no_adjacent_singletons=no_adjacent_singletons,
     )
     if args.connectivity_cases < 0:
         raise ValueError("--connectivity-cases must be non-negative")
@@ -694,7 +709,11 @@ def main() -> None:
     data_manifest_sha256 = sha256_file(data_manifest_path)
     records = load_manifest(data_manifest_path)
     data_config = load_yaml(config["data_config"])
-    audit_formal_source_provenance(records, data_config=data_config)
+    audit_formal_source_provenance(
+        records,
+        data_config=data_config,
+        enabled_tasks=tuple(config["tasks"]),
+    )
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True, use_fast=True)
     if tokenizer_sha256(tokenizer) != checkpoint_manifest.get("tokenizer_sha256"):
         if checkpoint_manifest.get("tokenizer_sha256") is not None:
@@ -747,7 +766,7 @@ def main() -> None:
                 result_path=existing_result,
                 checkpoint_hash=checkpoint_hash,
                 data_manifest_sha256=data_manifest_sha256,
-                num_moirai_blocks=num_moirai_blocks,
+                merge_cost_threshold=merge_cost_threshold,
             )
             task_results[task] = json.loads(existing_result.read_text(encoding="utf-8"))
             continue
@@ -762,15 +781,10 @@ def main() -> None:
             checkpoint_hash=checkpoint_hash,
             data_manifest_sha256=data_manifest_sha256,
             num_transformer_blocks=int(checkpoint_manifest["num_hidden_layers"]),
-            num_moirai_blocks=num_moirai_blocks,
+            merge_cost_threshold=merge_cost_threshold,
             candidate_block_lengths=candidate_block_lengths,
-            no_adjacent_singletons=no_adjacent_singletons,
             resume=bool(args.resume),
         )
-    if {int(result["num_moirai_blocks"]) for result in task_results.values()} != {
-        num_moirai_blocks
-    }:
-        raise RuntimeError("Discovery tasks do not share the fixed N")
     peak_memory_bytes = 0
     if torch.cuda.is_available():
         peak_memory = torch.tensor(
@@ -791,12 +805,9 @@ def main() -> None:
             "data_manifest_sha256": data_manifest_sha256,
             "model_type": checkpoint_manifest["model_type"],
             "num_transformer_blocks": model_num_layers,
-            "fixed_block_size": int(config["fixed_block_size"]),
-            "num_blocks_policy": config["num_blocks_policy"],
+            "merge_cost_threshold": merge_cost_threshold,
             "min_block_length": int(config["min_block_length"]),
-            "max_block_length": int(config["max_block_length"]),
-            "feasible_partition_count": feasible_partition_count,
-            "num_moirai_blocks": num_moirai_blocks,
+            "max_block_length": max_length,
             "connectivity_cases_per_task": connectivity_cases,
             "world_size": context.world_size,
             "dtype": "bfloat16",

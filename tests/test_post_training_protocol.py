@@ -11,7 +11,7 @@ from src.adapter.train_query import nonpadding_token_count, validate_adapter_con
 from src.adapter.train_fixed_query import validate_fixed_adapter_config
 from src.common import load_yaml
 from src.discovery.dynamic_programming import solve_partition
-from src.discovery.run_all import validate_discovery_config
+from src.discovery.run_all import require_defined_merge_threshold, validate_discovery_config
 from src.evaluation.run_evaluation import validate_evaluation_config
 from src.evaluation.task_metrics import task_score
 from src.data.format_tasks import (
@@ -37,11 +37,16 @@ def test_requested_case_counts_and_preserved_training_protocol() -> None:
     data = load_yaml("configs/data.yaml")
     assert data["sources"]["gsm8k"]["dataset_name"] == "gsm8k"
     assert set(data["sources"]) == {
+        "2wikimultihopqa",
         "clutrr",
         "gsm8k",
         "hotpotqa",
+        "math_train",
         "svamp",
         "mbpp",
+        "musique",
+        "openmathinstruct2",
+        "xcoder_80k",
     }
     assert data["sources"]["clutrr"]["repo_id"] == "CLUTRR/v1"
     assert data["sources"]["clutrr"]["task_name"] == "task_1.2"
@@ -62,15 +67,27 @@ def test_requested_case_counts_and_preserved_training_protocol() -> None:
     }
     assert data["discovery_sources"]["math"] == {"gsm8k": 500, "svamp": 500}
     assert data["discovery_sources"]["multihop"] == {"clutrr": 1000}
-    assert data["discovery_sources"]["code"] == {"mbpp": 500}
+    assert data["discovery_sources"]["code"] == {
+        "mbpp": 374,
+        "xcoder_80k": 126,
+    }
+    assert set(data["external_sources"]) == {
+        "2wikimultihopqa",
+        "math_train",
+        "musique",
+        "openmathinstruct2",
+        "xcoder_80k",
+    }
     assert data["training_sources"] == {
         "math": ["gsm8k", "svamp"],
         "multihop": ["clutrr", "hotpotqa"],
-        "code": ["mbpp"],
+        "code": ["mbpp", "xcoder_80k"],
     }
     assert data["counts"]["stage3_adapter_train"] == 1000
     assert data["task_count_overrides"]["code"]["stage3_adapter_train"] == 200
-    assert data["allowed_cross_stage_reuse"] == []
+    assert data["allowed_cross_stage_reuse"] == [
+        ["stage2_discovery", "probe_train"]
+    ]
     assert data["counts"]["probe_train"] == 200
     assert data["counts"]["probe_val"] == 500
     assert data["counts"]["stage4_final_eval"] == 10
@@ -81,6 +98,8 @@ def test_requested_case_counts_and_preserved_training_protocol() -> None:
     probe = load_yaml("configs/probe.yaml")
     evaluation = load_yaml("configs/evaluation.yaml")
     validate_discovery_config(discovery)
+    with pytest.raises(RuntimeError, match="MERGE_THRESHOLD_UNDEFINED"):
+        require_defined_merge_threshold(discovery)
     validate_adapter_config(adapter)
     with pytest.raises(RuntimeError, match="Fixed mode is disabled"):
         validate_fixed_adapter_config(fixed_adapter)
@@ -96,11 +115,10 @@ def test_requested_case_counts_and_preserved_training_protocol() -> None:
     assert probe["classes"] == {0: "math", 1: "multihop", 2: "code"}
     assert probe["classifier"] == "Linear(5120,3)"
     assert probe["confidence_threshold"] == 0.5
-    assert discovery["fixed_block_size"] == 4
-    assert discovery["num_blocks_policy"] == "ceil_num_layers_over_fixed_block_size"
-    assert discovery["min_block_length"] == 2
-    assert discovery["max_block_length"] == 6
-    assert "num_moirai_blocks" not in discovery
+    assert discovery["merge_cost_threshold"] is None
+    assert discovery["min_block_length"] == 1
+    assert "fixed_block_size" not in discovery
+    assert "num_blocks_policy" not in discovery
     assert adapter["training_token_unit"] == "nonpadding_input"
     assert adapter["training_passes"] == 1
     assert adapter["checkpoint_interval_steps"] == 100
@@ -159,7 +177,7 @@ def test_code_manifest_uses_one_pool_and_keeps_final_evaluation_isolated() -> No
         "probe_val": 45,
         "stage4_final_eval": 10,
     }
-    assert {row["dataset"] for row in records} == {"mbpp"}
+    assert {row["dataset"] for row in records} == {"mbpp", "xcoder_80k"}
     assert {row["official_split"] for row in records} == {
         "train",
         "validation",
@@ -167,7 +185,7 @@ def test_code_manifest_uses_one_pool_and_keeps_final_evaluation_isolated() -> No
     }
     assert {
         row["official_split"] for row in by_stage["stage3_adapter_train"]
-    } == {"train", "validation", "test"}
+    } == {"train"}
     assert {
         row["official_split"] for row in by_stage["stage4_final_eval"]
     }.issubset({"train", "validation", "test"})
@@ -183,13 +201,18 @@ def test_code_manifest_uses_one_pool_and_keeps_final_evaluation_isolated() -> No
     assert not discovery_ids & query_ids
     for isolated_stage in {
         "stage3_adapter_val",
-        "probe_train",
         "probe_val",
         "stage4_final_eval",
     }:
         isolated_ids = {row["stable_id"] for row in by_stage[isolated_stage]}
         assert not isolated_ids & discovery_ids
         assert not isolated_ids & query_ids
+
+    probe_train_ids = {
+        row["stable_id"] for row in by_stage["probe_train"]
+    }
+    assert probe_train_ids & discovery_ids
+    assert not probe_train_ids & query_ids
 
     final_ids = {row["stable_id"] for row in by_stage["stage4_final_eval"]}
     prior_ids = {
@@ -202,11 +225,15 @@ def test_code_manifest_uses_one_pool_and_keeps_final_evaluation_isolated() -> No
 
     audit = audit_manifest(
         "outputs/data/splits.json",
-        allowed_cross_stage_reuse=(),
+        allowed_cross_stage_reuse=(
+            ("stage2_discovery", "probe_train"),
+        ),
     )
     assert audit["status"] == "PASS"
     assert audit["id_intersections"] == []
     assert audit["content_hash_intersections"] == []
+    assert audit["allowed_id_intersection_counts"]
+    assert audit["allowed_content_intersection_counts"]
 
 
 def test_every_stage_is_unique_and_final_eval_is_globally_unused() -> None:
@@ -315,22 +342,28 @@ def test_mbpp_code_format_uses_only_validated_prompt_and_target_fields() -> None
     assert format_task_target("code", row, mapping) == row["target"]
 
 
-def test_qwen3_14b_depth_uses_same_partition_rules() -> None:
+def test_qwen3_14b_adaptive_partition_is_independent_of_fixed_baseline() -> None:
     fixed = fixed_kimi_partition(task="fixed", num_transformer_blocks=40)
     assert fixed.task == "fixed"
     assert fixed.lengths == (4, 4, 4, 4, 4, 4, 4, 4, 4, 4)
 
     costs = np.full((40, 40), np.inf, dtype=np.float64)
     for start in range(40):
+        costs[start, start] = 0.0
         for length in range(2, 7):
             end = start + length - 1
             if end >= 40:
                 continue
-            costs[start, end] = float(end - start + 1)
-    result = solve_partition(costs, num_blocks=10, task="math", candidate_lengths=range(2, 7))
-    assert len(result.partition.blocks) == 10
+            costs[start, end] = 0.1
+    result = solve_partition(
+        costs,
+        merge_cost_threshold=0.5,
+        task="math",
+        candidate_lengths=range(1, 41),
+    )
+    assert len(result.partition.blocks) == 7
     assert sum(result.partition.lengths) == 40
-    assert min(result.partition.lengths) >= 2
+    assert min(result.partition.lengths) >= 1
     assert max(result.partition.lengths) <= 6
     result.partition.validate()
 

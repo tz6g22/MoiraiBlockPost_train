@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
-CONFIG="${QWEN3_FORMAL_CONFIG:-$ROOT/qwen3_14b_config.yaml}"
+CONFIG="${QWEN3_FORMAL_CONFIG:-$ROOT/qwen3_1.7b_config.yaml}"
 
 if [[ ! -x "$PYTHON" ]]; then
   printf 'Missing Python executable: %s\n' "$PYTHON" >&2

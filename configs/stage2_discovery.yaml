@@ -10,9 +10,6 @@ discovery_cases_per_task:
   math: 1000
   multihop: 1000
   code: 500
-fixed_block_size: 4
-num_blocks_policy: ceil_num_layers_over_fixed_block_size
-min_block_length: 2
-max_block_length: 6
-no_adjacent_singletons: true
+merge_cost_threshold: null
+min_block_length: 1
 output_dir: outputs/formal/discovery_formal

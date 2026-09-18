@@ -14,10 +14,14 @@ from src.data.format_tasks import (
 )
 from src.discovery.dynamic_programming import (
     brute_force_partition,
-    count_feasible_partitions,
     solve_partition,
+    solve_similarity_partition,
 )
-from src.discovery.fixed_policy import resolve_fixed_num_blocks
+from src.discovery.linear_cka import (
+    compute_linear_cka_matrix,
+    interval_similarity_matrix,
+    linear_cka_similarity,
+)
 from src.discovery.ordinary_residual import (
     collect_ordinary_residual_reference,
     pairwise_directional_interval_cost,
@@ -92,6 +96,55 @@ def test_pairwise_directional_cost_masks_padding_representation() -> None:
     )
 
 
+def test_linear_cka_is_centered_and_scale_invariant() -> None:
+    left = torch.tensor(
+        [[1.0, 0.0], [-1.0, 0.0], [1.0, 0.0], [-1.0, 0.0]]
+    )
+    right = torch.tensor(
+        [[0.0, 2.0], [0.0, -2.0], [0.0, -2.0], [0.0, 2.0]]
+    )
+    assert abs(linear_cka_similarity(left, left) - 1.0) < 1.0e-6
+    assert abs(linear_cka_similarity(left, 7.0 * left) - 1.0) < 1.0e-6
+    assert linear_cka_similarity(left, right) < 1.0e-6
+
+
+def test_linear_cka_interval_matrix_and_similarity_dp() -> None:
+    residuals = torch.tensor(
+        [
+            [[1.0, 0.0], [-1.0, 0.0], [1.0, 0.0], [-1.0, 0.0]],
+            [[2.0, 0.0], [-2.0, 0.0], [2.0, 0.0], [-2.0, 0.0]],
+            [[0.0, 1.0], [0.0, -1.0], [0.0, -1.0], [0.0, 1.0]],
+            [[0.0, 2.0], [0.0, -2.0], [0.0, -2.0], [0.0, 2.0]],
+        ]
+    )
+    layer_cka = compute_linear_cka_matrix(residuals, device=torch.device("cpu"))
+    interval = interval_similarity_matrix(layer_cka)
+    assert np.allclose(np.diag(interval), 1.0)
+    result = solve_similarity_partition(
+        interval,
+        similarity_threshold=0.9,
+        task="tiny",
+    )
+    assert result.partition.lengths == (2, 2)
+    assert sum(result.partition.lengths) == 4
+
+
+def test_linear_cka_interval_min_reduction_is_stricter_than_mean() -> None:
+    layer_cka = np.array(
+        [
+            [1.0, 0.9, 0.2],
+            [0.9, 1.0, 0.4],
+            [0.2, 0.4, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    mean = interval_similarity_matrix(layer_cka, reduction="mean")
+    minimum = interval_similarity_matrix(layer_cka, reduction="min")
+    assert mean[0, 2] == np.mean([0.9, 0.2, 0.4])
+    assert minimum[0, 2] == 0.2
+    assert minimum[0, 2] < mean[0, 2]
+
+
 def test_native_qwen_reference_is_forward_only_and_task_inputs_differ() -> None:
     torch.manual_seed(7)
     model = _tiny_model()
@@ -121,72 +174,86 @@ def test_native_qwen_reference_is_forward_only_and_task_inputs_differ() -> None:
 def test_dp_consumes_residual_cost_matrix_without_replay() -> None:
     matrix = np.full((6, 6), np.inf, dtype=np.float64)
     for start in range(6):
-        for length in (1, 2):
+        for length in (1, 2, 3):
             end = start + length - 1
             if end < 6:
-                matrix[start, end] = float(length * 10 + start)
-    dp = solve_partition(matrix, num_blocks=3, task="tiny", candidate_lengths=[1, 2])
-    brute = brute_force_partition(matrix, num_blocks=3, task="tiny", candidate_lengths=[1, 2])
+                matrix[start, end] = 0.2 if length == 2 else 0.8 if length == 3 else 0.0
+    dp = solve_partition(
+        matrix,
+        merge_cost_threshold=0.5,
+        task="tiny",
+        candidate_lengths=[1, 2, 3],
+    )
+    brute = brute_force_partition(
+        matrix,
+        merge_cost_threshold=0.5,
+        task="tiny",
+        candidate_lengths=[1, 2, 3],
+    )
     assert dp.partition.sha256 == brute.partition.sha256
     assert dp.cost == brute.cost
 
 
-def test_qwen3_partition_search_space_is_non_degenerate() -> None:
-    feasible = count_feasible_partitions(
-        40,
-        num_blocks=10,
-        candidate_lengths=[2, 3, 4, 5, 6],
+def test_cost_threshold_controls_interval_legality() -> None:
+    matrix = np.full((3, 3), np.inf, dtype=np.float64)
+    np.fill_diagonal(matrix, 0.0)
+    matrix[0, 1] = 0.5
+    matrix[0, 2] = 0.6
+    accepted = solve_partition(
+        matrix, merge_cost_threshold=0.5, task="tiny", candidate_lengths=[1, 2, 3]
     )
-    assert feasible == 856945
-    assert feasible > 1
-
-
-def test_synthetic_costs_can_move_qwen3_boundaries() -> None:
-    allowed_lengths = (2, 3, 4, 5, 6)
-    targets = (
-        (4,) * 10,
-        (3, 5, 4, 4, 2, 6, 3, 5, 4, 4),
-        (5, 3, 3, 5, 4, 4, 6, 2, 4, 4),
+    rejected = solve_partition(
+        matrix, merge_cost_threshold=0.4, task="tiny", candidate_lengths=[1, 2, 3]
     )
-
-    results = []
-    for target in targets:
-        matrix = np.full((40, 40), np.inf, dtype=np.float64)
-        start = 0
-        for length in allowed_lengths:
-            for position in range(40 - length + 1):
-                matrix[position, position + length - 1] = 1.0
-        for length in target:
-            matrix[start, start + length - 1] = 0.0
-            start += length
-        result = solve_partition(
-            matrix,
-            num_blocks=10,
-            task="synthetic",
-            candidate_lengths=allowed_lengths,
-        )
-        assert result.partition.lengths == target
-        assert len(result.partition.blocks) == 10
-        assert sum(result.partition.lengths) == 40
-        assert min(result.partition.lengths) >= 2
-        assert max(result.partition.lengths) <= 6
-        assert result.cost == 0.0
-        results.append(result.partition)
-
-    assert results[0].boundary_ends != results[1].boundary_ends
-    assert results[1].boundary_ends != results[2].boundary_ends
-    assert results[1].lengths != (4,) * 10
-    assert results[2].lengths != (4,) * 10
+    assert accepted.partition.lengths == (2, 1)
+    assert rejected.partition.lengths == (1, 1, 1)
 
 
-def test_partition_metadata_round_trip_preserves_2_to_6_constraints() -> None:
+def test_emergent_block_count_prefers_full_merge_when_legal() -> None:
+    matrix = np.full((6, 6), np.inf, dtype=np.float64)
+    for start in range(6):
+        for end in range(start, 6):
+            matrix[start, end] = 0.0 if start == end else 0.1
+    result = solve_partition(matrix, merge_cost_threshold=0.5, task="tiny")
+    assert result.partition.lengths == (6,)
+
+
+def test_singletons_are_legal_fallback_and_create_more_blocks() -> None:
+    matrix = np.full((6, 6), np.inf, dtype=np.float64)
+    np.fill_diagonal(matrix, 0.0)
+    for start in range(6):
+        for end in range(start + 1, 6):
+            matrix[start, end] = 1.0
+    result = solve_partition(matrix, merge_cost_threshold=0.5, task="tiny")
+    assert result.partition.lengths == (1, 1, 1, 1, 1, 1)
+
+
+def test_task_costs_can_produce_different_emergent_partitions() -> None:
+    high_redundancy = np.full((4, 4), np.inf, dtype=np.float64)
+    low_redundancy = np.full((4, 4), np.inf, dtype=np.float64)
+    for start in range(4):
+        high_redundancy[start, start] = low_redundancy[start, start] = 0.0
+        for end in range(start + 1, 4):
+            high_redundancy[start, end] = 0.1
+            low_redundancy[start, end] = 1.0
+    math_partition = solve_partition(
+        high_redundancy, merge_cost_threshold=0.5, task="math"
+    ).partition
+    multihop_partition = solve_partition(
+        low_redundancy, merge_cost_threshold=0.5, task="multihop"
+    ).partition
+    assert math_partition != multihop_partition
+    assert len(math_partition.blocks) != len(multihop_partition.blocks)
+
+
+def test_partition_metadata_round_trip_preserves_candidate_constraints() -> None:
     partition = MoiraiPartition.from_lengths(
         [6, 4],
         task="math",
         num_transformer_blocks=10,
         min_length=2,
         max_length=6,
-        no_adjacent_singletons=True,
+        no_adjacent_singletons=False,
     )
     restored = MoiraiPartition.from_dict(partition.to_dict())
     assert restored == partition
@@ -194,44 +261,12 @@ def test_partition_metadata_round_trip_preserves_2_to_6_constraints() -> None:
     assert restored.lengths == (6, 4)
 
 
-def test_fixed_block_count_policy_uses_dynamic_model_depth() -> None:
-    assert resolve_fixed_num_blocks(
-        28, fixed_block_size=4, policy="ceil_num_layers_over_fixed_block_size"
-    ) == 7
-    assert resolve_fixed_num_blocks(
-        32, fixed_block_size=4, policy="ceil_num_layers_over_fixed_block_size"
-    ) == 8
-    assert resolve_fixed_num_blocks(
-        36, fixed_block_size=4, policy="ceil_num_layers_over_fixed_block_size"
-    ) == 9
-
-
-def test_tasks_share_n_and_fixed_baseline_has_same_completed_block_count() -> None:
-    task_n = {
-        task: resolve_fixed_num_blocks(
-            40,
-            fixed_block_size=4,
-            policy="ceil_num_layers_over_fixed_block_size",
-        )
-        for task in ("math", "multihop", "code")
-    }
-    assert task_n == {"math": 10, "multihop": 10, "code": 10}
-
+def test_fixed_baseline_is_independent_of_adaptive_discovery() -> None:
     fixed = fixed_kimi_partition(
         task="fixed", num_transformer_blocks=40, block_size=4
     )
-    adaptive = MoiraiPartition.from_lengths(
-        [3, 5, 4, 4, 2, 6, 3, 5, 4, 4],
-        task="math",
-        num_transformer_blocks=40,
-        min_length=2,
-        max_length=6,
-    )
-    assert len(fixed.blocks) == len(adaptive.blocks) == 10
-    assert fixed.boundary_ends != adaptive.boundary_ends
     assert fixed.lengths == (4,) * 10
-    assert min(adaptive.lengths) >= 2 and max(adaptive.lengths) <= 6
-    assert sum(adaptive.lengths) == sum(fixed.lengths) == 40
+    assert fixed.task == "fixed"
 
 
 def test_fixed_kimi_allows_short_final_block() -> None:
@@ -239,9 +274,7 @@ def test_fixed_kimi_allows_short_final_block() -> None:
         task="fixed", num_transformer_blocks=30, block_size=4
     )
     assert partition.lengths == (4, 4, 4, 4, 4, 4, 4, 2)
-    assert len(partition.blocks) == resolve_fixed_num_blocks(
-        30, fixed_block_size=4, policy="ceil_num_layers_over_fixed_block_size"
-    )
+    assert len(partition.blocks) == 8
 
 
 def test_local_math_multihop_code_cases_are_task_specific() -> None:

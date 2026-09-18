@@ -105,7 +105,7 @@ def convert_qwen3_checkpoint(
         max_block_length=max_block_length,
         no_adjacent_singletons=no_adjacent_singletons,
     )
-    # Avoid a second fully initialized 14B CPU model during conversion.  The
+    # Avoid a second fully initialized large CPU model during conversion.  The
     # native tensors are assigned directly below; only new formal parameters
     # are then allocated explicitly.
     with torch.device("meta"):

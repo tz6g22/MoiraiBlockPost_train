@@ -115,7 +115,7 @@ def main() -> None:
     parser.add_argument("--tiny", action="store_true")
     args = parser.parse_args()
     if not args.tiny:
-        raise SystemExit("Use --tiny for the local connectivity test; no formal 14B training is started.")
+        raise SystemExit("Use --tiny for the local connectivity test; no formal training is started.")
     print(run_tiny_connectivity())
 
 

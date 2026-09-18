@@ -106,6 +106,8 @@ def build_joint_optimizer(
     attnres_lr: float,
     backbone_weight_decay: float,
     attnres_weight_decay: float = 0.0,
+    query_lr: float | None = None,
+    alpha_lr: float | None = None,
     betas: tuple[float, float] = (0.9, 0.95),
     eps: float = 1.0e-8,
 ) -> torch.optim.Optimizer:
@@ -115,11 +117,40 @@ def build_joint_optimizer(
     attnres = [named[name] for name in audit["attnres"]]
     if not backbone or not attnres:
         raise ValueError("Formal optimizer groups cannot be empty")
-    return torch.optim.AdamW(
-        [
+    if (query_lr is None) != (alpha_lr is None):
+        raise ValueError("query_lr and alpha_lr must be provided together")
+    if query_lr is None:
+        groups = [
             {"params": backbone, "lr": backbone_lr, "weight_decay": backbone_weight_decay},
             {"params": attnres, "lr": attnres_lr, "weight_decay": attnres_weight_decay},
-        ],
+        ]
+    else:
+        query_names = set(audit["query"])
+        alpha_names = set(audit["alpha"])
+        query = [named[name] for name in sorted(query_names)]
+        alpha = [named[name] for name in sorted(alpha_names)]
+        other_attnres = [
+            named[name]
+            for name in audit["attnres"]
+            if name not in query_names and name not in alpha_names
+        ]
+        if not query or not alpha:
+            raise ValueError("Formal query and alpha optimizer groups cannot be empty")
+        groups = [
+            {"params": backbone, "lr": backbone_lr, "weight_decay": backbone_weight_decay},
+            {"params": query, "lr": query_lr, "weight_decay": attnres_weight_decay},
+            {"params": alpha, "lr": alpha_lr, "weight_decay": attnres_weight_decay},
+        ]
+        if other_attnres:
+            groups.append(
+                {
+                    "params": other_attnres,
+                    "lr": attnres_lr,
+                    "weight_decay": attnres_weight_decay,
+                }
+            )
+    return torch.optim.AdamW(
+        groups,
         betas=betas,
         eps=eps,
     )

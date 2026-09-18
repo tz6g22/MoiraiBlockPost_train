@@ -20,7 +20,6 @@ from src.formal.task_banks import TaskBank
 from src.modeling.partition import MoiraiPartition
 
 
-FORMAL_TASKS = ("math", "multihop", "code")
 FORBIDDEN_FIXED_KEYS = ("P_fixed", "Q_fixed", "Alpha_fixed", "fixed_checkpoint", "fixed_fallback")
 
 
@@ -74,10 +73,13 @@ def save_joint_checkpoint(
     consumed_tokens: dict[str, int],
     seed: int,
     identity_test: dict[str, Any],
+    training_progress: dict[str, Any] | None = None,
+    metrics_files: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Save the complete shared-backbone plus three task-bank state."""
-    if set(banks) != set(FORMAL_TASKS) or set(partitions) != set(FORMAL_TASKS):
-        raise ValueError("Formal checkpoint requires exactly math/multihop/code")
+    """Save the complete shared-backbone plus the enabled task-bank state."""
+    tasks = tuple(banks)
+    if len(tasks) < 2 or set(partitions) != set(tasks):
+        raise ValueError("Formal checkpoint task banks and partitions do not match")
     if any(key in config for key in FORBIDDEN_FIXED_KEYS):
         raise ValueError("Fixed keys cannot enter a formal checkpoint config")
     if identity_test.get("status") != "PASS":
@@ -116,7 +118,7 @@ def save_joint_checkpoint(
     if dist.is_initialized():
         dist.barrier()
     task_records: dict[str, Any] = {}
-    for task in FORMAL_TASKS:
+    for task in tasks:
         bank = banks[task]
         if bank.task != task or bank.partition_sha256 != partitions[task]["partition_sha256"]:
             raise ValueError(f"Task bank and partition metadata disagree for {task}")
@@ -153,7 +155,7 @@ def save_joint_checkpoint(
     if distributed:
         task_optimizer_path = root / f"task_optimizer_rank{dist.get_rank()}.pt"
         torch.save(
-            {task: banks[task].optimizer_state for task in FORMAL_TASKS},
+            {task: banks[task].optimizer_state for task in tasks},
             task_optimizer_path,
         )
         rng_state = {"torch": torch.get_rng_state()}
@@ -169,7 +171,7 @@ def save_joint_checkpoint(
         dist.all_gather_object(rng_hashes, local_rng_hash)
         if is_rank0:
             torch.save(
-                {task: banks[task].optimizer_state for task in FORMAL_TASKS},
+                {task: banks[task].optimizer_state for task in tasks},
                 root / "task_optimizer.pt",
             )
             rng_state = {"torch": torch.get_rng_state()}
@@ -178,7 +180,7 @@ def save_joint_checkpoint(
             torch.save(rng_state, root / "rng.pt")
     else:
         torch.save(
-            {task: banks[task].optimizer_state for task in FORMAL_TASKS},
+            {task: banks[task].optimizer_state for task in tasks},
             root / "task_optimizer.pt",
         )
         rng_state = {"torch": torch.get_rng_state()}
@@ -190,25 +192,25 @@ def save_joint_checkpoint(
     if dist.is_initialized():
         dist.barrier()
     manifest = {
-        "checkpoint_kind": "formal_shared_backbone_three_task",
+        "checkpoint_kind": "formal_shared_backbone",
         "base_model_hash": base_checkpoint_sha256,
         "base_checkpoint_sha256": base_checkpoint_sha256,
         "shared_backbone_file": shared_path.name,
         "shared_backbone_hash": shared_file_hash,
         "shared_backbone_sha256": shared_file_hash,
-        "enabled_tasks": list(FORMAL_TASKS),
-        "tasks": task_records,
+        "enabled_tasks": list(tasks),
+        "task_banks": task_records,
         "partition_per_task": {
-            task: partitions[task] for task in FORMAL_TASKS
+            task: partitions[task] for task in tasks
         },
         "partition_hash_per_task": {
-            task: task_records[task]["partition_sha256"] for task in FORMAL_TASKS
+            task: task_records[task]["partition_sha256"] for task in tasks
         },
         "query_hash_per_task": {
-            task: task_records[task]["query_sha256"] for task in FORMAL_TASKS
+            task: task_records[task]["query_sha256"] for task in tasks
         },
         "alpha_hash_per_task": {
-            task: task_records[task]["alpha_sha256"] for task in FORMAL_TASKS
+            task: task_records[task]["alpha_sha256"] for task in tasks
         },
         "optimizer_config": config["training"]["optimizer"],
         "scheduler_config": config["training"]["scheduler"],
@@ -235,8 +237,10 @@ def save_joint_checkpoint(
         "data_manifest_sha256": data_manifest_sha256,
         "identity_test": identity_test,
         "token_budget": config["data"]["token_budget"],
-        "consumed_tokens_per_task": {task: int(consumed_tokens[task]) for task in FORMAL_TASKS},
+        "consumed_tokens_per_task": {task: int(consumed_tokens[task]) for task in tasks},
         "seed": int(seed),
+        "training_progress": training_progress or {},
+        "metrics_files": metrics_files or {},
         "forbidden_fixed_keys": list(FORBIDDEN_FIXED_KEYS),
     }
     manifest["manifest_sha256"] = sha256_json(manifest)
@@ -281,50 +285,59 @@ def load_joint_checkpoint(
 ) -> dict[str, Any]:
     """Restore and validate every formal shared/task state before training or inference."""
     root = Path(checkpoint_dir)
-    manifest = json.loads((root / "checkpoint_manifest.json").read_text(encoding="utf-8"))
+    manifest_path = root / "checkpoint_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"STALE_CHECKPOINT_MISMATCH: formal checkpoint manifest is missing: {manifest_path}"
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     declared_manifest_hash = manifest.get("manifest_sha256")
     manifest_payload = dict(manifest)
     manifest_payload.pop("manifest_sha256", None)
     if declared_manifest_hash != sha256_json(manifest_payload):
         raise ValueError("Formal checkpoint manifest hash mismatch")
-    if manifest.get("enabled_tasks") != list(FORMAL_TASKS):
-        raise ValueError("Formal checkpoint task set is not math/multihop/code")
+    tasks = tuple(banks)
+    if tuple(manifest.get("enabled_tasks", ())) != tasks:
+        raise ValueError("TASK_ORDER_MISMATCH: formal checkpoint task set does not match enabled tasks")
     if manifest.get("base_model_hash") != manifest.get("base_checkpoint_sha256"):
-        raise ValueError("Formal checkpoint base model hash aliases disagree")
+        raise ValueError("MODEL_IDENTITY_MISMATCH: formal checkpoint base model hash aliases disagree")
     if manifest.get("shared_backbone_hash") != manifest.get("shared_backbone_sha256"):
-        raise ValueError("Formal checkpoint shared-backbone hash aliases disagree")
+        raise ValueError("STALE_CHECKPOINT_MISMATCH: formal checkpoint shared-backbone hash aliases disagree")
     if manifest.get("data_manifest_hash") != manifest.get("data_manifest_sha256"):
-        raise ValueError("Formal checkpoint data-manifest hash aliases disagree")
-    if set(manifest.get("partition_per_task", ())) != set(FORMAL_TASKS):
-        raise ValueError("Formal checkpoint partition_per_task is incomplete")
-    for task in FORMAL_TASKS:
-        task_record = manifest.get("tasks", {}).get(task, {})
+        raise ValueError("STALE_CHECKPOINT_MISMATCH: formal checkpoint data-manifest hash aliases disagree")
+    if set(manifest.get("partition_per_task", ())) != set(tasks):
+        raise ValueError("STALE_PARTITION_MISMATCH: formal checkpoint partition_per_task is incomplete")
+    task_banks = manifest.get("task_banks", {})
+    if set(task_banks) != set(tasks):
+        raise ValueError("TASK_ORDER_MISMATCH: formal checkpoint task_banks do not match enabled tasks")
+    for task in tasks:
+        task_record = task_banks.get(task, {})
         if manifest["partition_hash_per_task"].get(task) != task_record.get("partition_sha256"):
-            raise ValueError(f"Formal checkpoint partition hash index mismatch for {task}")
+            raise ValueError(f"STALE_PARTITION_MISMATCH: formal checkpoint partition hash index mismatch for {task}")
         if manifest["query_hash_per_task"].get(task) != task_record.get("query_sha256"):
-            raise ValueError(f"Formal checkpoint query hash index mismatch for {task}")
+            raise ValueError(f"STALE_CHECKPOINT_MISMATCH: formal checkpoint query hash index mismatch for {task}")
         if manifest["alpha_hash_per_task"].get(task) != task_record.get("alpha_sha256"):
-            raise ValueError(f"Formal checkpoint alpha hash index mismatch for {task}")
+            raise ValueError(f"STALE_CHECKPOINT_MISMATCH: formal checkpoint alpha hash index mismatch for {task}")
     checkpoint_config = manifest.get("config", {})
     if manifest.get("optimizer_config") != checkpoint_config.get("training", {}).get("optimizer"):
-        raise ValueError("Formal checkpoint optimizer config is not self-consistent")
+        raise ValueError("STALE_CHECKPOINT_MISMATCH: formal checkpoint optimizer config is not self-consistent")
     if manifest.get("scheduler_config") != checkpoint_config.get("training", {}).get("scheduler"):
-        raise ValueError("Formal checkpoint scheduler config is not self-consistent")
+        raise ValueError("STALE_CHECKPOINT_MISMATCH: formal checkpoint scheduler config is not self-consistent")
     identity_test = manifest.get("identity_test")
     if not isinstance(identity_test, dict) or identity_test.get("status") != "PASS":
-        raise ValueError("Formal checkpoint identity test is missing or failed")
+        raise ValueError("MODEL_IDENTITY_MISMATCH: formal checkpoint identity test is missing or failed")
     if (
         expected_base_checkpoint_sha256 is not None
         and identity_test.get("base_checkpoint_sha256") != expected_base_checkpoint_sha256
     ):
-        raise ValueError("Formal checkpoint identity/base hash mismatch")
+        raise ValueError("MODEL_IDENTITY_MISMATCH: formal checkpoint identity/base hash mismatch")
     if identity_test.get("converted_config_sha256") != converted_config_sha256(model):
-        raise ValueError("Formal checkpoint identity/converted-config hash mismatch")
+        raise ValueError("MODEL_IDENTITY_MISMATCH: formal checkpoint identity/converted-config hash mismatch")
     if isinstance(model, FSDP):
         declared_world_size = int(manifest.get("distributed_world_size", 0))
         if not dist.is_initialized() or declared_world_size != dist.get_world_size():
             raise ValueError(
-                "Formal checkpoint world size does not match the active FSDP process group"
+                "STALE_CHECKPOINT_MISMATCH: formal checkpoint world size does not match the active FSDP process group"
             )
     expected_identity = {
         "base_checkpoint_sha256": expected_base_checkpoint_sha256,
@@ -333,18 +346,19 @@ def load_joint_checkpoint(
     }
     for field, expected in expected_identity.items():
         if expected is not None and manifest.get(field) != expected:
-            raise ValueError(f"Formal checkpoint {field} mismatch")
+            status = "MODEL_IDENTITY_MISMATCH" if field == "base_checkpoint_sha256" else "STALE_CHECKPOINT_MISMATCH"
+            raise ValueError(f"{status}: formal checkpoint {field} mismatch")
     if set(manifest.get("forbidden_fixed_keys", ())) != set(FORBIDDEN_FIXED_KEYS):
-        raise ValueError("Formal checkpoint Fixed-key policy mismatch")
+        raise ValueError("STALE_CHECKPOINT_MISMATCH: formal checkpoint Fixed-key policy mismatch")
     if any(
         "fixed" in str(key).lower()
         for key in manifest
         if key != "forbidden_fixed_keys"
     ):
-        raise ValueError("Formal checkpoint manifest contains a Fixed entry")
+        raise ValueError("STALE_CHECKPOINT_MISMATCH: formal checkpoint manifest contains a Fixed entry")
     shared_path = root / manifest["shared_backbone_file"]
     if sha256_file(shared_path) != manifest["shared_backbone_sha256"]:
-        raise ValueError("Shared backbone checkpoint hash mismatch")
+        raise ValueError("STALE_CHECKPOINT_MISMATCH: shared backbone checkpoint hash mismatch")
     shared = load_file(shared_path, device="cpu")
     if isinstance(model, FSDP):
         with FSDP.state_dict_type(
@@ -360,35 +374,35 @@ def load_joint_checkpoint(
     # must be present so a partial backbone cannot pass reload validation.
     allowed_missing = set(task_routing_parameter_names(model))
     if set(incompatible.missing_keys) - allowed_missing or incompatible.unexpected_keys:
-        raise ValueError(f"Shared backbone state mismatch: {incompatible}")
+        raise ValueError(f"STALE_CHECKPOINT_MISMATCH: shared backbone state mismatch: {incompatible}")
     loaded_banks: dict[str, TaskBank] = {}
-    for task in FORMAL_TASKS:
-        if task not in banks or task not in manifest["tasks"]:
-            raise ValueError(f"Formal checkpoint is missing task {task}")
-        record = manifest["tasks"][task]
+    for task in tasks:
+        if task not in banks or task not in task_banks:
+            raise ValueError(f"TASK_ORDER_MISMATCH: formal checkpoint is missing task {task}")
+        record = task_banks[task]
         partition_record = record.get("partition", {})
         if partition_record.get("task") != task:
-            raise ValueError(f"Formal checkpoint partition task mismatch for {task}")
+            raise ValueError(f"STALE_PARTITION_MISMATCH: formal checkpoint partition task mismatch for {task}")
         partition = MoiraiPartition.from_dict(partition_record)
         if partition.num_transformer_blocks != int(_model_config(model).num_hidden_layers):
-            raise ValueError(f"Formal checkpoint depth mismatch for {task}")
+            raise ValueError(f"MODEL_IDENTITY_MISMATCH: formal checkpoint depth mismatch for {task}")
         if partition.sha256 != record["partition_sha256"]:
-            raise ValueError(f"Formal checkpoint partition hash mismatch for {task}")
+            raise ValueError(f"STALE_PARTITION_MISMATCH: formal checkpoint partition hash mismatch for {task}")
         state: dict[str, torch.Tensor] = {}
         for field in ("query_file", "alpha_file"):
             path = root / record[field]
             if sha256_file(path) != record[field.replace("file", "sha256")]:
-                raise ValueError(f"{task} {field} hash mismatch")
+                raise ValueError(f"STALE_CHECKPOINT_MISMATCH: {task} {field} hash mismatch")
             state.update(load_file(path, device="cpu"))
         query_state = {name: value for name, value in state.items() if "pseudo_query" in name}
         alpha_state = {name: value for name, value in state.items() if "alpha" in name}
         if _state_hash(query_state) != record.get("query_state_sha256"):
-            raise ValueError(f"{task} query state hash mismatch")
+            raise ValueError(f"STALE_CHECKPOINT_MISMATCH: {task} query state hash mismatch")
         if _state_hash(alpha_state) != record.get("alpha_state_sha256"):
-            raise ValueError(f"{task} alpha state hash mismatch")
+            raise ValueError(f"STALE_CHECKPOINT_MISMATCH: {task} alpha state hash mismatch")
         bank = banks[task]
         if bank.partition_sha256 != record["partition_sha256"] or set(bank.state) != set(state):
-            raise ValueError(f"Task bank metadata mismatch for {task}")
+            raise ValueError(f"STALE_CHECKPOINT_MISMATCH: task bank metadata mismatch for {task}")
         bank.partition_lengths = tuple(partition.lengths)
         bank.state = {name: value.clone() for name, value in state.items()}
         bank.optimizer_state = {}
@@ -398,10 +412,10 @@ def load_joint_checkpoint(
         hashes = manifest.get("task_optimizer_sha256")
         rank = dist.get_rank()
         if not isinstance(files, list) or len(files) != dist.get_world_size():
-            raise ValueError("Formal checkpoint lacks per-rank task optimizer states")
+            raise ValueError("STALE_CHECKPOINT_MISMATCH: formal checkpoint lacks per-rank task optimizer states")
         task_optimizer_path = root / files[rank]
         if isinstance(hashes, list) and sha256_file(task_optimizer_path) != hashes[rank]:
-            raise ValueError("Formal task optimizer state hash mismatch")
+            raise ValueError("STALE_CHECKPOINT_MISMATCH: formal task optimizer state hash mismatch")
     else:
         task_optimizer_path = root / manifest["task_optimizer_file"]
     task_optimizer = torch.load(
@@ -409,9 +423,9 @@ def load_joint_checkpoint(
         map_location="cpu",
         weights_only=False,
     )
-    if set(task_optimizer) != set(FORMAL_TASKS):
-        raise ValueError("Formal checkpoint task optimizer state is incomplete")
-    for task in FORMAL_TASKS:
+    if set(task_optimizer) != set(tasks):
+        raise ValueError("STALE_CHECKPOINT_MISMATCH: formal checkpoint task optimizer state is incomplete")
+    for task in tasks:
         loaded_banks[task].optimizer_state = task_optimizer[task]
     if optimizer is not None:
         optimizer_state = torch.load(
@@ -441,10 +455,10 @@ def load_joint_checkpoint(
             hashes = manifest.get("rng_sha256")
             rank = dist.get_rank()
             if not isinstance(files, list) or len(files) != dist.get_world_size():
-                raise ValueError("Formal checkpoint lacks per-rank RNG states")
+                raise ValueError("STALE_CHECKPOINT_MISMATCH: formal checkpoint lacks per-rank RNG states")
             rng_path = root / files[rank]
             if isinstance(hashes, list) and sha256_file(rng_path) != hashes[rank]:
-                raise ValueError("Formal RNG state hash mismatch")
+                raise ValueError("STALE_CHECKPOINT_MISMATCH: formal RNG state hash mismatch")
         else:
             rng_path = root / manifest["rng_file"]
         rng_state = torch.load(rng_path, map_location="cpu", weights_only=False)

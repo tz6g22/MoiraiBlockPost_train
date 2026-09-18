@@ -8,26 +8,31 @@ from src.common import sha256_file
 from src.data.format_tasks import (
     PromptOnlyExample,
     TargetCausalExample,
+    TASK_TO_SOURCE,
     encode_prompt_only,
     encode_prompt_target,
     load_dataset_pool,
     load_manifest,
 )
+from src.data.leakage_audit import normalize_stage_overlap_pairs
 from src.data.source_provenance import (
     audit_formal_source_provenance,
     validate_manifest_row_identity,
 )
 
 
-FORMAL_TASKS = ("math", "multihop", "code")
-
-
 def validate_formal_source_policy(
     formal_config: dict[str, Any],
     data_config: dict[str, Any],
+    enabled_tasks: tuple[str, ...] | None = None,
 ) -> None:
     """Ensure the formal config's declared source policy is executable."""
     data = formal_config.get("data", {})
+    tasks = tuple(
+        enabled_tasks
+        or formal_config.get("tasks", {}).get("enabled", ())
+        or TASK_TO_SOURCE
+    )
     policy = data.get("source_policy")
     if policy != "local_first_then_external_topup":
         raise ValueError(
@@ -50,7 +55,7 @@ def validate_formal_source_policy(
             for source in data.get(task, {}).get("local_sources", ())
             if str(source) not in configured_keys
         )
-        for task in FORMAL_TASKS
+        for task in tasks
     }
     missing_local = {
         task: values for task, values in missing_local.items() if values
@@ -68,7 +73,7 @@ def validate_formal_source_policy(
             for source in data.get(task, {}).get("external_topup_priority", ())
             if str(source) not in external_sources
         )
-        for task in FORMAL_TASKS
+        for task in tasks
     }
     missing_external = {
         task: values for task, values in missing_external.items() if values
@@ -78,6 +83,52 @@ def validate_formal_source_policy(
             "CONFIG_DECLARED_BUT_NOT_ENFORCED: external top-up sources are "
             f"not registered or executable: {missing_external}"
         )
+    allowed_overlap_pairs = normalize_stage_overlap_pairs(
+        data_config.get("allowed_cross_stage_reuse", ())
+    )
+    if allowed_overlap_pairs != frozenset(
+        {frozenset(("stage2_discovery", "probe_train"))}
+    ):
+        raise ValueError(
+            "Formal data may allow only stage2_discovery/probe_train reuse"
+        )
+
+
+def validate_training_source_mixture(
+    records_by_task: dict[str, tuple[dict[str, Any], ...]],
+    *,
+    data_config: dict[str, Any],
+    enabled_tasks: tuple[str, ...],
+) -> None:
+    """Require every configured task-local source to be available to the sampler."""
+    weights_by_task = data_config.get("training_source_weights", {})
+    source_registry = {
+        key: source
+        for section in ("sources", "external_sources")
+        for key, source in data_config.get(section, {}).items()
+    }
+    for task in enabled_tasks:
+        weights = weights_by_task.get(task)
+        if not isinstance(weights, dict) or not weights:
+            raise RuntimeError(f"DATA_SOURCE_MIX_MISMATCH: missing source weights for {task}")
+        total = sum(float(value) for value in weights.values())
+        if abs(total - 1.0) > 1.0e-8 or any(float(value) <= 0.0 for value in weights.values()):
+            raise RuntimeError(f"DATA_SOURCE_MIX_MISMATCH: invalid source weights for {task}")
+        expected_datasets = set()
+        for source_key in weights:
+            if source_key not in source_registry:
+                raise RuntimeError(
+                    f"DATA_SOURCE_MIX_MISMATCH: unregistered source {source_key} for {task}"
+                )
+            expected_datasets.add(str(source_registry[source_key]["dataset_name"]))
+        actual_datasets = {
+            str(record.get("dataset")) for record in records_by_task.get(task, ())
+        }
+        if actual_datasets != expected_datasets:
+            raise RuntimeError(
+                f"DATA_SOURCE_MIX_MISMATCH: {task} manifest sources "
+                f"{sorted(actual_datasets)} != configured {sorted(expected_datasets)}"
+            )
 
 
 def load_formal_records(path: str | Path) -> list[dict[str, Any]]:
@@ -99,14 +150,18 @@ def records_by_task_and_stage(
     *,
     stage: str,
     expected_counts: dict[str, int] | None = None,
+    enabled_tasks: tuple[str, ...] | None = None,
 ) -> dict[str, tuple[dict[str, Any], ...]]:
+    tasks = tuple(enabled_tasks or expected_counts or ())
+    if not tasks:
+        raise ValueError("records_by_task_and_stage requires enabled tasks")
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
         task = str(record.get("task", ""))
-        if task in FORMAL_TASKS and record.get("assigned_split") == stage:
+        if task in tasks and record.get("assigned_split") == stage:
             grouped[task].append(record)
     result: dict[str, tuple[dict[str, Any], ...]] = {}
-    for task in FORMAL_TASKS:
+    for task in tasks:
         values = sorted(grouped.get(task, []), key=lambda item: str(item["split_key"]))
         if expected_counts is not None and len(values) != int(expected_counts[task]):
             raise RuntimeError(
