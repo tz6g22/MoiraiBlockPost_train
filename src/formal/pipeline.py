@@ -973,6 +973,7 @@ def _run_train(
         maximum_tokens=sum(token_budgets.values()),
         warmup_ratio=float(config["training"]["scheduler"]["warmup_ratio"]),
         min_lr_ratio=float(config["training"]["scheduler"]["min_lr_ratio"]),
+        task_budgets=token_budgets,
     )
     initial_progress: dict[str, Any] = {}
     if resume:

@@ -33,7 +33,8 @@ class JointStepResult:
     nonpadding_input_tokens: int
     target_tokens: int
     learning_rate_backbone: float
-    learning_rate_query_alpha: float
+    learning_rate_query: float
+    learning_rate_alpha: float
     alpha_parameter_norm: float
     alpha_parameter_delta: float
     query_parameter_norm: float
@@ -98,6 +99,19 @@ def _optimizer_contains(
         for parameter in group["params"]
     }
     return bool(selected_ids) and selected_ids <= optimizer_ids
+
+
+def _optimizer_group_lr(
+    optimizer: torch.optim.Optimizer,
+    name: str,
+    fallback_index: int,
+) -> float:
+    for group in optimizer.param_groups:
+        if group.get("name") == name:
+            return float(group["lr"])
+    if fallback_index < len(optimizer.param_groups):
+        return float(optimizer.param_groups[fallback_index]["lr"])
+    return 0.0
 
 
 def _source_cycle_spec(
@@ -260,8 +274,9 @@ def train_joint_step(
         alpha_grad_norm=alpha_grad,
         nonpadding_input_tokens=nonpadding_input_tokens,
         target_tokens=target_tokens,
-        learning_rate_backbone=float(optimizer.param_groups[0]["lr"]),
-        learning_rate_query_alpha=float(optimizer.param_groups[1]["lr"]),
+        learning_rate_backbone=_optimizer_group_lr(optimizer, "backbone", 0),
+        learning_rate_query=_optimizer_group_lr(optimizer, "query", 1),
+        learning_rate_alpha=_optimizer_group_lr(optimizer, "alpha", 2),
         alpha_parameter_norm=_state_norm(alpha_after, "alpha"),
         alpha_parameter_delta=_state_delta(alpha_before, alpha_after, "alpha"),
         query_parameter_norm=_state_norm(query_after, "pseudo_query"),
@@ -272,7 +287,7 @@ def train_joint_step(
 
 
 class FormalTokenScheduler:
-    """Cosine schedule whose progress is measured in actual input tokens."""
+    """Global shared-parameter schedule plus task-local Q/Alpha schedules."""
 
     def __init__(
         self,
@@ -281,6 +296,7 @@ class FormalTokenScheduler:
         maximum_tokens: int,
         warmup_ratio: float,
         min_lr_ratio: float,
+        task_budgets: Mapping[str, int] | None = None,
     ) -> None:
         if maximum_tokens <= 0:
             raise ValueError("maximum_tokens must be positive")
@@ -293,24 +309,99 @@ class FormalTokenScheduler:
         self.warmup_tokens = int(self.maximum_tokens * warmup_ratio)
         self.min_lr_ratio = float(min_lr_ratio)
         self.base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        self.group_names = [group.get("name") for group in optimizer.param_groups]
+        self.task_budgets = {
+            str(task): int(budget)
+            for task, budget in (task_budgets or {}).items()
+        }
+        if any(budget <= 0 for budget in self.task_budgets.values()):
+            raise ValueError("Task-local scheduler budgets must be positive")
+        self.task_local_enabled = bool(
+            self.task_budgets
+            and {"query", "alpha"}.issubset(set(self.group_names))
+        )
+        self.active_task: str | None = None
+        self.task_trained_tokens = 0
         self.trained_tokens = 0
         self.step(0)
+        if self.task_local_enabled:
+            self._apply_task_ratio(0.0)
+
+    @staticmethod
+    def _ratio(
+        trained_tokens: int,
+        maximum_tokens: int,
+        warmup_ratio: float,
+        min_lr_ratio: float,
+    ) -> float:
+        warmup_tokens = int(maximum_tokens * warmup_ratio)
+        if trained_tokens < warmup_tokens:
+            return trained_tokens / max(1, warmup_tokens)
+        progress = min(
+            1.0,
+            (trained_tokens - warmup_tokens)
+            / max(1, maximum_tokens - warmup_tokens),
+        )
+        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+    def _apply_task_ratio(self, ratio: float) -> None:
+        for group, base_lr, name in zip(
+            self.optimizer.param_groups, self.base_lrs, self.group_names
+        ):
+            if name in {"query", "alpha"}:
+                group["lr"] = base_lr * ratio
+
+    def activate_task(self, task: str, trained_tokens: int = 0) -> None:
+        if not self.task_local_enabled:
+            return
+        if task not in self.task_budgets:
+            raise ValueError(f"Unknown task-local scheduler task: {task}")
+        if not 0 <= int(trained_tokens) <= self.task_budgets[task]:
+            raise ValueError(f"Invalid task-local token position for {task}")
+        self.active_task = task
+        self.task_trained_tokens = int(trained_tokens)
+        self._apply_task_ratio(
+            self._ratio(
+                self.task_trained_tokens,
+                self.task_budgets[task],
+                self.warmup_tokens / self.maximum_tokens,
+                self.min_lr_ratio,
+            )
+        )
+
+    def step_task(self, trained_tokens: int) -> None:
+        if not self.task_local_enabled:
+            return
+        if self.active_task is None:
+            raise RuntimeError("Task-local scheduler has no active task")
+        budget = self.task_budgets[self.active_task]
+        if not 0 <= int(trained_tokens) <= budget:
+            raise ValueError(f"Invalid task-local token position for {self.active_task}")
+        self.task_trained_tokens = int(trained_tokens)
+        self._apply_task_ratio(
+            self._ratio(
+                self.task_trained_tokens,
+                budget,
+                self.warmup_tokens / self.maximum_tokens,
+                self.min_lr_ratio,
+            )
+        )
 
     def step(self, trained_tokens: int) -> None:
         self.trained_tokens = int(trained_tokens)
-        if self.trained_tokens < self.warmup_tokens:
-            ratio = self.trained_tokens / max(1, self.warmup_tokens)
-        else:
-            progress = min(
-                1.0,
-                (self.trained_tokens - self.warmup_tokens)
-                / max(1, self.maximum_tokens - self.warmup_tokens),
-            )
-            ratio = self.min_lr_ratio + (1.0 - self.min_lr_ratio) * 0.5 * (
-                1.0 + math.cos(math.pi * progress)
-            )
-        for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-            group["lr"] = base_lr * ratio
+        ratio = self._ratio(
+            self.trained_tokens,
+            self.maximum_tokens,
+            self.warmup_tokens / self.maximum_tokens,
+            self.min_lr_ratio,
+        )
+        for group, base_lr, name in zip(
+            self.optimizer.param_groups, self.base_lrs, self.group_names
+        ):
+            if not self.task_local_enabled or name in {"backbone", "attnres"}:
+                group["lr"] = base_lr * ratio
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -319,6 +410,12 @@ class FormalTokenScheduler:
             "min_lr_ratio": self.min_lr_ratio,
             "base_lrs": self.base_lrs,
             "trained_tokens": self.trained_tokens,
+            "task_local": {
+                "enabled": self.task_local_enabled,
+                "task_budgets": self.task_budgets,
+                "active_task": self.active_task,
+                "trained_tokens": self.task_trained_tokens,
+            },
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -333,6 +430,15 @@ class FormalTokenScheduler:
         if list(state.get("base_lrs", [])) != self.base_lrs:
             raise ValueError("Scheduler base learning rates differ")
         self.step(int(state["trained_tokens"]))
+        task_local = state.get("task_local", {})
+        if self.task_local_enabled:
+            if not task_local.get("enabled"):
+                raise ValueError("Task-local scheduler state is missing")
+            if task_local.get("task_budgets") != self.task_budgets:
+                raise ValueError("Task-local scheduler budgets differ")
+            active_task = task_local.get("active_task")
+            if active_task is not None:
+                self.activate_task(active_task, int(task_local.get("trained_tokens", 0)))
 
 
 def choose_next_task(
@@ -558,6 +664,7 @@ def train_token_budget_sequential(
             maximum_tokens=sum(int(token_budgets[task]) for task in order),
             warmup_ratio=float(scheduler_config["warmup_ratio"]),
             min_lr_ratio=float(scheduler_config["min_lr_ratio"]),
+            task_budgets=token_budgets,
         )
 
     progress = dict(initial_progress or {})
@@ -598,6 +705,7 @@ def train_token_budget_sequential(
     results: list[JointStepResult] = []
     for task_index in range(start_index, len(order)):
         task = order[task_index]
+        scheduler.activate_task(task, consumed[task])
         while consumed[task] < int(token_budgets[task]):
             inactive_before = {
                 other: banks[other].state_hash()
@@ -647,6 +755,7 @@ def train_token_budget_sequential(
             task_training_wall_seconds[task] += step_wall_seconds
             global_training_wall_seconds += step_wall_seconds
             scheduler.step(sum(consumed.values()))
+            scheduler.step_task(consumed[task])
             results.append(result)
             current_progress = _sequential_progress(
                 task_order=order,
@@ -667,7 +776,8 @@ def train_token_budget_sequential(
                     "task": task,
                     "loss": result.loss,
                     "learning_rate_backbone": result.learning_rate_backbone,
-                    "learning_rate_query_alpha": result.learning_rate_query_alpha,
+                    "learning_rate_query": result.learning_rate_query,
+                    "learning_rate_alpha": result.learning_rate_alpha,
                     "non_padding_tokens_this_step": result.nonpadding_input_tokens,
                     "target_tokens_this_step": result.target_tokens,
                     "alpha_parameter_norm": result.alpha_parameter_norm,
@@ -722,6 +832,8 @@ def train_token_budget_sequential(
             global_training_wall_seconds=global_training_wall_seconds,
         )
         if on_task_boundary is not None:
+            if task_index + 1 < len(order):
+                scheduler.activate_task(order[task_index + 1], consumed[order[task_index + 1]])
             on_task_boundary(next_progress, optimizer, scheduler)
 
     final_progress = _sequential_progress(

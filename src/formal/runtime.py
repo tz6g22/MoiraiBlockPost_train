@@ -121,8 +121,8 @@ def build_joint_optimizer(
         raise ValueError("query_lr and alpha_lr must be provided together")
     if query_lr is None:
         groups = [
-            {"params": backbone, "lr": backbone_lr, "weight_decay": backbone_weight_decay},
-            {"params": attnres, "lr": attnres_lr, "weight_decay": attnres_weight_decay},
+            {"name": "backbone", "params": backbone, "lr": backbone_lr, "weight_decay": backbone_weight_decay},
+            {"name": "attnres", "params": attnres, "lr": attnres_lr, "weight_decay": attnres_weight_decay},
         ]
     else:
         query_names = set(audit["query"])
@@ -137,13 +137,14 @@ def build_joint_optimizer(
         if not query or not alpha:
             raise ValueError("Formal query and alpha optimizer groups cannot be empty")
         groups = [
-            {"params": backbone, "lr": backbone_lr, "weight_decay": backbone_weight_decay},
-            {"params": query, "lr": query_lr, "weight_decay": attnres_weight_decay},
-            {"params": alpha, "lr": alpha_lr, "weight_decay": attnres_weight_decay},
+            {"name": "backbone", "params": backbone, "lr": backbone_lr, "weight_decay": backbone_weight_decay},
+            {"name": "query", "params": query, "lr": query_lr, "weight_decay": attnres_weight_decay},
+            {"name": "alpha", "params": alpha, "lr": alpha_lr, "weight_decay": attnres_weight_decay},
         ]
         if other_attnres:
             groups.append(
                 {
+                    "name": "attnres",
                     "params": other_attnres,
                     "lr": attnres_lr,
                     "weight_decay": attnres_weight_decay,
