@@ -30,13 +30,14 @@ model:
 
 pipeline:
   run_id: qwen3_1_7b_formal_retrain_seed42
-  run_root: outputs/formal_retrain/main_tasklocal_lr
+  run_root: outputs/formal_retrain/main_tasklocal_lr_retry_1589170
   data_config: configs/data_qwen3_1.7b.yaml
-  data_manifest: outputs/formal_retrain/main_tasklocal_lr/data/splits.json
+  data_manifest: outputs/formal_retrain/main_tasklocal_lr_retry_1589170/data/splits.json
+  canonical_math_validation_manifest: outputs/formal_retrain/shared/math_validation_manifest.json
   discovery_output: outputs/formal_retrain/main/discovery
-  joint_checkpoint_output: outputs/formal_retrain/main_tasklocal_lr/checkpoint
-  probe_output: outputs/formal_retrain/main_tasklocal_lr/probe
-  evaluation_output: outputs/formal_retrain/main_tasklocal_lr/evaluation
+  joint_checkpoint_output: outputs/formal_retrain/main_tasklocal_lr_retry_1589170/checkpoint
+  probe_output: outputs/formal_retrain/main_tasklocal_lr_retry_1589170/probe
+  evaluation_output: outputs/formal_retrain/main_tasklocal_lr_retry_1589170/evaluation
   max_sequence_length: 4096
 
 attnres:
@@ -240,6 +241,7 @@ training:
   precision:
     compute: bfloat16
     parameters: bfloat16
+    routing_parameters: float32
     loss_accumulation: float32
 
   batching:

@@ -78,7 +78,7 @@ def save_joint_checkpoint(
 ) -> dict[str, Any]:
     """Save the complete shared-backbone plus the enabled task-bank state."""
     tasks = tuple(banks)
-    if len(tasks) < 2 or set(partitions) != set(tasks):
+    if not tasks or set(partitions) != set(tasks):
         raise ValueError("Formal checkpoint task banks and partitions do not match")
     if any(key in config for key in FORBIDDEN_FIXED_KEYS):
         raise ValueError("Fixed keys cannot enter a formal checkpoint config")
@@ -127,13 +127,18 @@ def save_joint_checkpoint(
         query_state = {name: value for name, value in bank.state.items() if "pseudo_query" in name}
         alpha_state = {name: value for name, value in bank.state.items() if "alpha" in name}
         query_hash = _save_state(task_dir / "query.safetensors", query_state) if is_rank0 else ""
-        alpha_hash = _save_state(task_dir / "alpha.safetensors", alpha_state) if is_rank0 else ""
+        alpha_file = f"{task}/alpha.safetensors" if alpha_state else None
+        alpha_hash = (
+            _save_state(task_dir / "alpha.safetensors", alpha_state)
+            if is_rank0 and alpha_state
+            else None
+        )
         task_records[task] = {
             "partition": partitions[task],
             "partition_sha256": bank.partition_sha256,
             "query_file": f"{task}/query.safetensors",
             "query_sha256": query_hash,
-            "alpha_file": f"{task}/alpha.safetensors",
+            "alpha_file": alpha_file,
             "alpha_sha256": alpha_hash,
             "query_state_sha256": _state_hash(query_state),
             "alpha_state_sha256": _state_hash(alpha_state),
@@ -390,8 +395,11 @@ def load_joint_checkpoint(
             raise ValueError(f"STALE_PARTITION_MISMATCH: formal checkpoint partition hash mismatch for {task}")
         state: dict[str, torch.Tensor] = {}
         for field in ("query_file", "alpha_file"):
-            path = root / record[field]
-            if sha256_file(path) != record[field.replace("file", "sha256")]:
+            relative_path = record.get(field)
+            if relative_path is None:
+                continue
+            path = root / relative_path
+            if sha256_file(path) != record.get(field.replace("file", "sha256")):
                 raise ValueError(f"STALE_CHECKPOINT_MISMATCH: {task} {field} hash mismatch")
             state.update(load_file(path, device="cpu"))
         query_state = {name: value for name, value in state.items() if "pseudo_query" in name}

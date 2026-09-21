@@ -21,6 +21,7 @@ def _materialize_formal_extras(
     names: set[str],
     *,
     dtype: torch.dtype,
+    routing_dtype: torch.dtype,
 ) -> None:
     """Materialize only parameters absent from the native Qwen3 state dict."""
     formal_parameters = dict(model.named_parameters())
@@ -28,11 +29,19 @@ def _materialize_formal_extras(
         parameter = formal_parameters[name]
         if parameter.device.type != "meta":
             continue
-        fill = 1.0 if "key_norm" in name else 0.0
+        if "alpha" in name:
+            fill = float(getattr(model.config, "formal_alpha_init", 0.0))
+        else:
+            fill = 1.0 if "key_norm" in name else 0.0
+        parameter_dtype = (
+            routing_dtype
+            if "pseudo_query" in name or "alpha" in name
+            else dtype
+        )
         _set_named_parameter(
             model,
             name,
-            torch.full(parameter.shape, fill, dtype=dtype, device="cpu"),
+            torch.full(parameter.shape, fill, dtype=parameter_dtype, device="cpu"),
         )
 
     # Qwen3's rotary frequency is a non-persistent buffer and is therefore not
@@ -59,6 +68,8 @@ def formal_config_from_qwen(
     min_block_length: int,
     max_block_length: int,
     no_adjacent_singletons: bool,
+    alpha_init: float = 0.0,
+    use_alpha: bool = True,
 ) -> MoiraiQwen3Config:
     payload: dict[str, Any] = config.to_dict()
     for key in ("architectures", "model_type", "transformers_version", "_name_or_path"):
@@ -71,6 +82,8 @@ def formal_config_from_qwen(
             "moirai_min_block_length": int(min_block_length),
             "moirai_max_block_length": int(max_block_length),
             "moirai_no_adjacent_singletons": bool(no_adjacent_singletons),
+            "formal_alpha_init": float(alpha_init),
+            "formal_use_alpha": bool(use_alpha),
             "use_cache": False,
         }
     )
@@ -85,7 +98,10 @@ def convert_qwen3_checkpoint(
     min_block_length: int,
     max_block_length: int,
     no_adjacent_singletons: bool,
+    alpha_init: float = 0.0,
+    use_alpha: bool = True,
     dtype: torch.dtype = torch.bfloat16,
+    routing_dtype: torch.dtype = torch.float32,
 ) -> tuple[Qwen3ForCausalLM, MoiraiQwen3ForCausalLM]:
     """Load native Qwen3 and create the post-Discovery formal runtime.
 
@@ -104,6 +120,8 @@ def convert_qwen3_checkpoint(
         min_block_length=min_block_length,
         max_block_length=max_block_length,
         no_adjacent_singletons=no_adjacent_singletons,
+        alpha_init=alpha_init,
+        use_alpha=use_alpha,
     )
     # Avoid a second fully initialized large CPU model during conversion.  The
     # native tensors are assigned directly below; only new formal parameters
@@ -125,6 +143,7 @@ def convert_qwen3_checkpoint(
         formal,
         allowed_missing,
         dtype=dtype,
+        routing_dtype=routing_dtype,
     )
     formal.config.moirai_partition = list(partition)
     formal.config.moirai_task = task

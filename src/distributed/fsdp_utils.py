@@ -140,9 +140,23 @@ def wrap_qwen3_fsdp(
     from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
 
     expected_trainable = trainable_parameter_names(model)
+    routing_parameters = tuple(
+        parameter
+        for name, parameter in named_parameters(model)
+        if "pseudo_query" in name or "alpha" in name
+    )
+    if not routing_parameters:
+        raise RuntimeError("Formal FSDP wrapping requires Query/Alpha parameters")
+    if any(parameter.dtype != torch.float32 for parameter in routing_parameters):
+        raise RuntimeError("Formal Query/Alpha parameters must be FP32 before FSDP")
     if not context.distributed:
         wrapped = model.to(context.device)
     else:
+        # FSDP does not move ignored states when `device_id` is used.  Keep
+        # these small FP32 parameters outside flattened BF16 shards, but make
+        # them local to the rank before the first routed forward.
+        for parameter in routing_parameters:
+            parameter.data = parameter.data.to(context.device)
         layer_classes = {Qwen3DecoderLayer, *decoder_layer_classes}
         if not any(isinstance(module, tuple(layer_classes)) for module in model.modules()):
             raise RuntimeError("No configured Qwen3 decoder-layer unit exists in the model")
@@ -163,6 +177,7 @@ def wrap_qwen3_fsdp(
             limit_all_gathers=True,
             sync_module_states=sync_module_states,
             device_id=device_id,
+            ignored_states=routing_parameters,
         )
     actual_trainable = trainable_parameter_names(wrapped)
     if actual_trainable != expected_trainable:
@@ -170,6 +185,11 @@ def wrap_qwen3_fsdp(
             "FSDP changed the trainable parameter set: "
             f"before={expected_trainable}, after={actual_trainable}"
         )
+    actual_named = dict(named_parameters(wrapped))
+    if any(actual_named[name].dtype != torch.float32 for name in actual_named if "pseudo_query" in name or "alpha" in name):
+        raise RuntimeError("Formal FSDP changed Query/Alpha parameters away from FP32")
+    if any(actual_named[name].device != context.device for name in actual_named if "pseudo_query" in name or "alpha" in name):
+        raise RuntimeError("Formal FSDP left Query/Alpha parameters on the wrong device")
     return wrapped
 
 
@@ -212,10 +232,19 @@ def _fsdp_parameter_owners(
             )
         )
     owned_ids = {id(parameter) for _, values in owners for _, parameter in values}
-    expected_ids = {id(parameter) for _, parameter in all_named}
-    if owned_ids != expected_ids:
-        raise RuntimeError("Unable to assign every parameter to one FSDP unit")
     return tuple(owners)
+
+
+def _fsdp_unmanaged_parameters(
+    model: nn.Module,
+    owners: tuple[tuple[FSDP, tuple[tuple[str, nn.Parameter], ...]], ...],
+) -> tuple[tuple[str, nn.Parameter], ...]:
+    owned_ids = {id(parameter) for _, values in owners for _, parameter in values}
+    return tuple(
+        (name, parameter)
+        for name, parameter in named_parameters(model)
+        if id(parameter) not in owned_ids
+    )
 
 
 def selected_parameter_state(
@@ -230,7 +259,8 @@ def selected_parameter_state(
             if predicate(name, parameter)
         }
     state: dict[str, torch.Tensor] | None = {} if context.is_rank0 else None
-    for unit, owned in _fsdp_parameter_owners(model):
+    owners = _fsdp_parameter_owners(model)
+    for unit, owned in owners:
         selected = tuple((name, parameter) for name, parameter in owned if predicate(name, parameter))
         if not selected:
             continue
@@ -245,6 +275,11 @@ def selected_parameter_state(
                 assert state is not None
                 for name, parameter in selected:
                     state[name] = parameter.detach().cpu().contiguous().clone()
+    if context.is_rank0:
+        assert state is not None
+        for name, parameter in _fsdp_unmanaged_parameters(model, owners):
+            if predicate(name, parameter):
+                state[name] = parameter.detach().cpu().contiguous().clone()
     return state
 
 
@@ -265,7 +300,8 @@ def load_selected_parameter_state(
             for name, value in state.items():
                 current[name].copy_(value.to(current[name].device, current[name].dtype))
         return
-    for unit, owned in _fsdp_parameter_owners(model):
+    owners = _fsdp_parameter_owners(model)
+    for unit, owned in owners:
         selected = tuple((name, parameter) for name, parameter in owned if predicate(name, parameter))
         if not selected:
             continue
@@ -279,6 +315,10 @@ def load_selected_parameter_state(
             with torch.no_grad():
                 for name, parameter in selected:
                     parameter.copy_(state[name].to(parameter.device, parameter.dtype))
+    with torch.no_grad():
+        for name, parameter in _fsdp_unmanaged_parameters(model, owners):
+            if predicate(name, parameter):
+                parameter.copy_(state[name].to(parameter.device, parameter.dtype))
 
 
 def selected_parameter_sha256(
@@ -304,17 +344,22 @@ def selected_parameter_sha256(
         for unit, values in owners
         for _, parameter in values
     }
-    selected = sorted(
+    managed_selected = sorted(
         (name, parameter, owner_by_parameter[id(parameter)])
         for name, parameter in named_parameters(model)
+        if predicate(name, parameter) and id(parameter) in owner_by_parameter
+    )
+    unmanaged_selected = tuple(
+        (name, parameter)
+        for name, parameter in _fsdp_unmanaged_parameters(model, owners)
         if predicate(name, parameter)
     )
     digest = hashlib.sha256() if context.is_rank0 else None
     index = 0
-    while index < len(selected):
-        unit = selected[index][2]
+    while index < len(managed_selected):
+        unit = managed_selected[index][2]
         stop = index + 1
-        while stop < len(selected) and selected[stop][2] is unit:
+        while stop < len(managed_selected) and managed_selected[stop][2] is unit:
             stop += 1
         with FSDP.summon_full_params(
             unit,
@@ -325,7 +370,7 @@ def selected_parameter_sha256(
         ):
             if context.is_rank0:
                 assert digest is not None
-                for name, parameter, _ in selected[index:stop]:
+                for name, parameter, _ in managed_selected[index:stop]:
                     tensor = parameter.detach().cpu().contiguous()
                     digest.update(name.encode("utf-8"))
                     digest.update(str(tensor.dtype).encode("ascii"))
@@ -334,6 +379,12 @@ def selected_parameter_sha256(
         index = stop
     if context.is_rank0:
         assert digest is not None
+        for name, parameter in unmanaged_selected:
+            tensor = parameter.detach().cpu().contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(tensor.dtype).encode("ascii"))
+            digest.update(str(tuple(tensor.shape)).encode("ascii"))
+            digest.update(tensor.view(torch.uint8).numpy().tobytes())
         value = digest.hexdigest()
     return broadcast_object(value, context)
 

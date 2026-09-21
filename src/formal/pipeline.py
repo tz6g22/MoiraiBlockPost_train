@@ -56,6 +56,11 @@ from src.formal.runtime import (
 from src.formal.task_banks import TaskBank
 from src.formal.train_joint import FormalTokenScheduler, train_token_budget_sequential
 from src.evaluation.task_metrics import mean_metrics, task_score
+from src.evaluation.math_validation import (
+    default_math_validation_manifest,
+    evaluate_causal_lm,
+    load_canonical_math_validation_examples,
+)
 from src.modeling.partition import MoiraiPartition
 
 
@@ -204,41 +209,16 @@ def _validation_loss(
     distributed_context,
 ) -> float:
     banks[task].activate(model)
-    model.eval()
-    rank = distributed_context.rank if distributed_context is not None else 0
-    world_size = distributed_context.world_size if distributed_context is not None else 1
-    loss_sum = torch.zeros((), dtype=torch.float32, device=device)
-    token_count = torch.zeros((), dtype=torch.float32, device=device)
-    for index, example in enumerate(examples):
-        if index % world_size != rank:
-            continue
-        batch = collate_target_examples([example], pad_token_id=tokenizer.pad_token_id)
-        batch.pop("target_mask")
-        labels = batch.pop("labels").to(device)
-        inputs = {key: value.to(device) for key, value in batch.items()}
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            logits = model(**inputs, labels=labels, use_cache=False, logits_to_keep=0).logits
-        valid = labels != -100
-        if not valid.any():
-            continue
-        loss_sum += torch.nn.functional.cross_entropy(
-            logits.float().reshape(-1, logits.shape[-1]),
-            labels.reshape(-1),
-            ignore_index=-100,
-            reduction="sum",
-        )
-        token_count += valid.sum()
-    if distributed_context is not None and distributed_context.distributed:
-        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
-    if token_count.item() <= 0:
-        raise RuntimeError("FORMAL_VALIDATION_HAS_NO_SUPERVISED_TOKENS")
-    value = loss_sum / token_count
-    if not torch.isfinite(value):
-        raise FloatingPointError("FORMAL_VALIDATION_LOSS_NAN_OR_INF")
+    value = evaluate_causal_lm(
+        model,
+        examples,
+        pad_token_id=int(tokenizer.pad_token_id),
+        device=device,
+        distributed_context=distributed_context,
+    )["loss"]
     banks[task].activate(model)
     model.train()
-    return float(value.cpu())
+    return float(value)
 
 
 def _summarize_metric_file(path: Path, task: str) -> dict[str, Any]:
@@ -609,6 +589,7 @@ def _load_formal_runtime(
     partitions: dict[str, MoiraiPartition],
     device: torch.device,
     identity_examples: Mapping[str, Sequence[TargetCausalExample]] | Sequence[TargetCausalExample] = (),
+    identity_pad_token_id: int = 0,
     load_checkpoint_dir: Path | None = None,
     distributed_context=None,
     expected_base_checkpoint_sha256: str | None = None,
@@ -626,7 +607,10 @@ def _load_formal_runtime(
         min_block_length=initial_partition.min_block_length,
         max_block_length=initial_partition.max_block_length,
         no_adjacent_singletons=initial_partition.no_adjacent_singletons,
+        alpha_init=float(config.get("attnres", {}).get("alpha", {}).get("init", 0.0)),
+        use_alpha=bool(config.get("attnres", {}).get("alpha", {}).get("enabled", True)),
         dtype=torch.bfloat16,
+        routing_dtype=torch.float32,
     )
     banks = _build_task_banks(formal, partitions)
     identity = None
@@ -660,9 +644,14 @@ def _load_formal_runtime(
         per_task_identity: dict[str, dict[str, Any]] = {}
         for task in tasks:
             banks[task].activate(formal)
-            example = examples_by_task[task][0]
-            ids = example.input_ids.unsqueeze(0)
-            mask = example.attention_mask.unsqueeze(0)
+            count = int(config.get("identity_test", {}).get("num_examples", 1))
+            selected = examples_by_task[task][:count]
+            batch = collate_target_examples(
+                selected,
+                pad_token_id=identity_pad_token_id,
+            )
+            ids = batch["input_ids"]
+            mask = batch["attention_mask"]
             if distributed_context is not None and distributed_context.distributed:
                 ids = ids.to(device)
                 mask = mask.to(device)
@@ -871,13 +860,30 @@ def _run_train(
         target=True,
         max_length=max_length,
     )
-    validation_examples = build_formal_examples(
-        validation_grouped,
-        data_config=data_config,
-        tokenizer=tokenizer,
-        target=True,
-        max_length=max_length,
+    canonical_manifest = config.get("pipeline", {}).get(
+        "canonical_math_validation_manifest",
+        str(default_math_validation_manifest()),
     )
+    validation_examples = {
+        task: (
+            load_canonical_math_validation_examples(
+                manifest_path=canonical_manifest,
+                data_manifest_path=config["pipeline"]["data_manifest"],
+                data_config_path=config["pipeline"]["data_config"],
+                tokenizer=tokenizer,
+                max_length=max_length,
+            )
+            if task == "math"
+            else build_formal_examples(
+                {task: validation_grouped[task]},
+                data_config=data_config,
+                tokenizer=tokenizer,
+                target=True,
+                max_length=max_length,
+            )[task]
+        )
+        for task in task_order
+    }
     source_registry = {
         key: source
         for section in ("sources", "external_sources")
@@ -935,7 +941,12 @@ def _run_train(
         checkpoint=checkpoint,
         partitions=partitions,
         device=device,
-        identity_examples=examples,
+        identity_examples=(
+            validation_examples
+            if not bool(config.get("attnres", {}).get("alpha", {}).get("enabled", True))
+            else examples
+        ),
+        identity_pad_token_id=tokenizer.pad_token_id,
         distributed_context=distributed_context,
     )
     del original
@@ -1277,7 +1288,7 @@ def _run_train(
         raise RuntimeError("FORMAL_BACKBONE_DID_NOT_UPDATE")
     if complete and not all(changed[task]["query"] for task in task_order):
         raise RuntimeError("FORMAL_TASK_QUERY_DID_NOT_UPDATE")
-    if complete and not all(changed[task]["alpha"] for task in task_order):
+    if complete and alpha_names and not all(changed[task]["alpha"] for task in task_order):
         raise RuntimeError("FORMAL_TASK_ALPHA_DID_NOT_UPDATE")
     summary = {
         "status": "PASS" if complete else "PARTIAL_CONNECTIVITY",
@@ -1298,6 +1309,13 @@ def _run_train(
             result.query_optimizer_membership for result in results
         ),
         "query_dtype": results[-1].query_dtype if results else None,
+        "alpha_dtype": results[-1].alpha_dtype if results else None,
+        "query_optimizer_state_dtype": (
+            results[-1].query_optimizer_state_dtype if results else None
+        ),
+        "alpha_optimizer_state_dtype": (
+            results[-1].alpha_optimizer_state_dtype if results else None
+        ),
         "trainability": {
             "backbone_parameter_count": len(backbone_names),
             "query_parameter_count": len(query_names),

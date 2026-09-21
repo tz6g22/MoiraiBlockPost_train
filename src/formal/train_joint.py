@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 import math
 import random
@@ -10,7 +10,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import torch
 import torch.distributed as dist
 
-from src.data.format_tasks import collate_target_examples
+from src.data.format_tasks import TargetCausalExample, collate_target_examples
 from src.distributed.fsdp_utils import (
     clip_grad_norm,
     named_parameters as distributed_named_parameters,
@@ -41,6 +41,9 @@ class JointStepResult:
     query_parameter_delta: float
     query_optimizer_membership: bool
     query_dtype: str
+    alpha_dtype: str
+    query_optimizer_state_dtype: str
+    alpha_optimizer_state_dtype: str
 
 
 def _group_norm(
@@ -114,6 +117,22 @@ def _optimizer_group_lr(
     return 0.0
 
 
+def _optimizer_state_dtype(
+    optimizer: torch.optim.Optimizer,
+    model,
+    names: Iterable[str],
+) -> str:
+    selected = set(names)
+    dtypes = {
+        str(value.dtype)
+        for name, parameter in distributed_named_parameters(model)
+        if name in selected
+        for key, value in optimizer.state.get(parameter, {}).items()
+        if key in {"exp_avg", "exp_avg_sq"} and isinstance(value, torch.Tensor)
+    }
+    return ",".join(sorted(dtypes)) if dtypes else "unavailable"
+
+
 def _source_cycle_spec(
     source_weights: Mapping[str, float],
 ) -> tuple[tuple[str, ...], dict[str, int]]:
@@ -153,6 +172,29 @@ def _source_example_for_step(
     order = list(range(len(values)))
     random.Random(int(seed) + 1000003 * task_index + epoch).shuffle(order)
     return values[order[position]]
+
+
+def _fit_example_to_token_budget(
+    example: TargetCausalExample,
+    remaining_tokens: int,
+) -> TargetCausalExample:
+    """Keep the final supervised tokens when the last step would overshoot."""
+    if remaining_tokens <= 0:
+        raise ValueError("Remaining token budget must be positive")
+    input_tokens = int(example.attention_mask.sum().item())
+    if input_tokens <= remaining_tokens:
+        return example
+    start = example.input_ids.numel() - remaining_tokens
+    fitted = replace(
+        example,
+        input_ids=example.input_ids[start:],
+        labels=example.labels[start:],
+        attention_mask=example.attention_mask[start:],
+        target_mask=example.target_mask[start:],
+    )
+    if not bool(fitted.target_mask.any()):
+        raise RuntimeError("Final budget slice contains no supervised target tokens")
+    return fitted
 
 
 def train_joint_step(
@@ -267,6 +309,11 @@ def train_joint_step(
         for name, parameter in distributed_named_parameters(model)
         if name in audit["query"]
     ]
+    alpha_parameters = [
+        parameter
+        for name, parameter in distributed_named_parameters(model)
+        if name in audit["alpha"]
+    ]
     return optimizer, JointStepResult(
         loss=float(reported_loss.cpu()),
         backbone_grad_norm=backbone_grad,
@@ -276,13 +323,24 @@ def train_joint_step(
         target_tokens=target_tokens,
         learning_rate_backbone=_optimizer_group_lr(optimizer, "backbone", 0),
         learning_rate_query=_optimizer_group_lr(optimizer, "query", 1),
-        learning_rate_alpha=_optimizer_group_lr(optimizer, "alpha", 2),
+        learning_rate_alpha=(
+            _optimizer_group_lr(optimizer, "alpha", 2)
+            if audit["alpha"]
+            else 0.0
+        ),
         alpha_parameter_norm=_state_norm(alpha_after, "alpha"),
         alpha_parameter_delta=_state_delta(alpha_before, alpha_after, "alpha"),
         query_parameter_norm=_state_norm(query_after, "pseudo_query"),
         query_parameter_delta=_state_delta(query_before, query_after, "pseudo_query"),
         query_optimizer_membership=_optimizer_contains(optimizer, model, audit["query"]),
         query_dtype=str(query_parameters[0].dtype) if query_parameters else "unavailable",
+        alpha_dtype=str(alpha_parameters[0].dtype) if alpha_parameters else "absent",
+        query_optimizer_state_dtype=_optimizer_state_dtype(optimizer, model, audit["query"]),
+        alpha_optimizer_state_dtype=(
+            _optimizer_state_dtype(optimizer, model, audit["alpha"])
+            if audit["alpha"]
+            else "absent"
+        ),
     )
 
 
@@ -731,6 +789,10 @@ def train_token_budget_sequential(
                             int(seed) + task_epochs[task] * len(order) + task_index
                         ).shuffle(orders[task])
                 example = examples_by_task[task][orders[task][task_positions[task]]]
+            example = _fit_example_to_token_budget(
+                example,
+                int(token_budgets[task]) - consumed[task],
+            )
             task_positions[task] += 1
             step_started = time.perf_counter()
             optimizer, result = train_joint_step(
@@ -788,6 +850,9 @@ def train_token_budget_sequential(
                     "query_grad_norm": result.query_grad_norm,
                     "query_optimizer_membership": result.query_optimizer_membership,
                     "query_dtype": result.query_dtype,
+                    "alpha_dtype": result.alpha_dtype,
+                    "query_optimizer_state_dtype": result.query_optimizer_state_dtype,
+                    "alpha_optimizer_state_dtype": result.alpha_optimizer_state_dtype,
                     "train_wall_seconds": step_wall_seconds,
                     "tokens_per_second": result.nonpadding_input_tokens / max(step_wall_seconds, 1.0e-9),
                 })

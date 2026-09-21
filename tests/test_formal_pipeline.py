@@ -27,7 +27,11 @@ from src.formal.pipeline import (
 )
 from src.formal.runtime import build_joint_optimizer, parameter_hash
 from src.formal.task_banks import TaskBank
-from src.formal.train_joint import FormalTokenScheduler, train_token_budget_sequential
+from src.formal.train_joint import (
+    FormalTokenScheduler,
+    _fit_example_to_token_budget,
+    train_token_budget_sequential,
+)
 from src.data.prepare_post_data import _weighted_counts
 from src.modeling.full_attnres import MoiraiQwen3ForCausalLM
 from src.modeling.partition import MoiraiPartition
@@ -654,6 +658,21 @@ def test_formal_checkpoint_round_trip_restores_shared_and_task_state(
     assert restored_scheduler.trained_tokens == 17
 
 
+def test_formal_final_budget_slice_preserves_supervised_tail() -> None:
+    example = TargetCausalExample(
+        input_ids=torch.arange(8),
+        labels=torch.arange(1, 9),
+        attention_mask=torch.ones(8, dtype=torch.long),
+        target_mask=torch.tensor([False] * 5 + [True] * 3),
+        stable_id="budget-boundary",
+    )
+    fitted = _fit_example_to_token_budget(example, 3)
+    assert fitted.input_ids.tolist() == [5, 6, 7]
+    assert fitted.labels.tolist() == [6, 7, 8]
+    assert fitted.target_mask.tolist() == [True, True, True]
+    assert _fit_example_to_token_budget(example, 8) is example
+
+
 @pytest.mark.parametrize(
     "task_order",
     [("math", "multihop"), ("multihop", "math")],
@@ -743,7 +762,7 @@ def test_formal_sequential_transition_preserves_backbone_and_isolates_banks(task
         },
         tokenizer=tokenizer,
         training_config=training_config,
-        token_budgets={task: 6 for task in task_order},
+        token_budgets={task: 5 for task in task_order},
         task_order=task_order,
         device=torch.device("cpu"),
         max_steps=4,
@@ -774,7 +793,7 @@ def test_formal_sequential_transition_preserves_backbone_and_isolates_banks(task
         }.issubset(record)
         for record in records
     )
-    assert consumed == {task: 6 for task in task_order}
+    assert consumed == {task: 5 for task in task_order}
     assert progress["completed_tasks"] == list(task_order)
     assert parameter_hash(model) != initial_backbone_hash
     assert len(boundary_backbone_hashes) == 2

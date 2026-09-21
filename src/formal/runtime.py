@@ -18,12 +18,9 @@ from src.modeling.partition import MoiraiPartition
 
 
 def alpha_parameter_names(model) -> tuple[str, ...]:
-    names = tuple(
+    return tuple(
         sorted(name for name, _ in distributed_named_parameters(model) if "alpha" in name)
     )
-    if not names:
-        raise ValueError("Formal model has no alpha parameters")
-    return names
 
 
 def task_routing_parameter_names(model) -> tuple[str, ...]:
@@ -117,8 +114,8 @@ def build_joint_optimizer(
     attnres = [named[name] for name in audit["attnres"]]
     if not backbone or not attnres:
         raise ValueError("Formal optimizer groups cannot be empty")
-    if (query_lr is None) != (alpha_lr is None):
-        raise ValueError("query_lr and alpha_lr must be provided together")
+    if query_lr is None and alpha_lr is not None:
+        raise ValueError("alpha_lr cannot be provided without query_lr")
     if query_lr is None:
         groups = [
             {"name": "backbone", "params": backbone, "lr": backbone_lr, "weight_decay": backbone_weight_decay},
@@ -134,13 +131,18 @@ def build_joint_optimizer(
             for name in audit["attnres"]
             if name not in query_names and name not in alpha_names
         ]
-        if not query or not alpha:
-            raise ValueError("Formal query and alpha optimizer groups cannot be empty")
+        if not query:
+            raise ValueError("Formal query optimizer group cannot be empty")
         groups = [
             {"name": "backbone", "params": backbone, "lr": backbone_lr, "weight_decay": backbone_weight_decay},
             {"name": "query", "params": query, "lr": query_lr, "weight_decay": attnres_weight_decay},
-            {"name": "alpha", "params": alpha, "lr": alpha_lr, "weight_decay": attnres_weight_decay},
         ]
+        if alpha:
+            if alpha_lr is None:
+                raise ValueError("alpha_lr is required when Alpha parameters exist")
+            groups.append(
+                {"name": "alpha", "params": alpha, "lr": alpha_lr, "weight_decay": attnres_weight_decay}
+            )
         if other_attnres:
             groups.append(
                 {
@@ -180,33 +182,67 @@ def identity_test(
     alpha_names = tuple(
         name for name, _ in converted_model.named_parameters() if "alpha" in name
     )
-    if not query_names or not alpha_names:
-        raise RuntimeError("Identity test requires converted Q and Alpha parameters")
-    if any(
-        not torch.equal(converted_model.get_parameter(name), torch.zeros_like(converted_model.get_parameter(name)))
+    if not query_names:
+        raise RuntimeError("Identity test requires converted pseudo-query parameters")
+    if not alpha_names:
+        original_model.eval()
+        converted_model.eval()
+        reference = original_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            logits_to_keep=0,
+        ).logits
+        converted = converted_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            logits_to_keep=0,
+        ).logits
+        max_abs, mean_abs = _logit_diff(reference, converted)
+        if not torch.isfinite(converted).all():
+            raise FloatingPointError("Converted no-alpha logits contain NaN or Inf")
+    return {
+            "max_abs_logit_diff": max_abs,
+            "mean_abs_logit_diff": mean_abs,
+            "num_examples": int(input_ids.shape[0]),
+            "identity_preserving": False,
+            "mode": "no_alpha_perturbation",
+            "status": "PASS",
+        }
+    saved_alpha = {
+        name: converted_model.get_parameter(name).detach().clone()
         for name in alpha_names
-    ):
-        raise RuntimeError("Identity test requires all converted alpha parameters to be zero")
+    }
+    with torch.no_grad():
+        for name in alpha_names:
+            converted_model.get_parameter(name).zero_()
     original_model.eval()
     converted_model.eval()
-    reference = original_model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=False,
-        logits_to_keep=0,
-    ).logits
-    converted = converted_model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=False,
-        logits_to_keep=0,
-    ).logits
-    max_abs, mean_abs = _logit_diff(reference, converted)
-    if not torch.isfinite(converted).all():
-        raise FloatingPointError("Converted alpha-zero logits contain NaN or Inf")
+    try:
+        reference = original_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            logits_to_keep=0,
+        ).logits
+        converted = converted_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            logits_to_keep=0,
+        ).logits
+        max_abs, mean_abs = _logit_diff(reference, converted)
+        if not torch.isfinite(converted).all():
+            raise FloatingPointError("Converted alpha-zero logits contain NaN or Inf")
+    finally:
+        with torch.no_grad():
+            for name, value in saved_alpha.items():
+                converted_model.get_parameter(name).copy_(value)
     return {
         "max_abs_logit_diff": max_abs,
         "mean_abs_logit_diff": mean_abs,
+        "num_examples": int(input_ids.shape[0]),
         "status": "PASS" if max_abs <= 5.0e-2 else "IDENTITY_CONVERSION_FAILED",
     }
 

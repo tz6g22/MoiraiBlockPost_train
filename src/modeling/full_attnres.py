@@ -43,6 +43,8 @@ class MoiraiQwen3Config(Qwen3Config):
         moirai_min_block_length: int = 1,
         moirai_max_block_length: int = 4,
         moirai_no_adjacent_singletons: bool = True,
+        formal_alpha_init: float = 0.0,
+        formal_use_alpha: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -54,6 +56,8 @@ class MoiraiQwen3Config(Qwen3Config):
         self.moirai_min_block_length = moirai_min_block_length
         self.moirai_max_block_length = moirai_max_block_length
         self.moirai_no_adjacent_singletons = moirai_no_adjacent_singletons
+        self.formal_alpha_init = float(formal_alpha_init)
+        self.formal_use_alpha = bool(formal_use_alpha)
 
 
 @dataclass(frozen=True)
@@ -113,6 +117,7 @@ class MoiraiQwen3DecoderLayer(nn.Module):
     def __init__(self, config: MoiraiQwen3Config, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self._use_alpha = bool(config.formal_use_alpha)
         self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -127,13 +132,15 @@ class MoiraiQwen3DecoderLayer(nn.Module):
         self.attn_key_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp_pseudo_query = nn.Parameter(torch.zeros(config.hidden_size))
         self.mlp_key_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # Formal task-specific gates are zero at conversion time.  They blend
-        # the Kimi-routed branch with the native residual stream without
-        # changing the Kimi cumulative block source semantics.
-        # FSDP requires managed parameters to have at least one dimension.
-        # A length-one tensor remains a per-site scalar under broadcasting.
-        self.attn_alpha = nn.Parameter(torch.zeros(1))
-        self.mlp_alpha = nn.Parameter(torch.zeros(1))
+        if self._use_alpha:
+            # FSDP requires managed parameters to have at least one dimension.
+            # A length-one tensor remains a per-site scalar under broadcasting.
+            self.attn_alpha = nn.Parameter(
+                torch.full((1,), float(config.formal_alpha_init))
+            )
+            self.mlp_alpha = nn.Parameter(
+                torch.full((1,), float(config.formal_alpha_init))
+            )
 
     def forward(
         self,
@@ -185,8 +192,9 @@ class MoiraiQwen3DecoderLayer(nn.Module):
             self.attn_pseudo_query,
             self.attn_key_norm,
         )
-        if native_hidden is not None:
-            z_attn = native_hidden + self.attn_alpha * (z_attn - native_hidden)
+        if native_hidden is not None and self._use_alpha:
+            attn_delta = z_attn - native_hidden
+            z_attn = native_hidden + self.attn_alpha.to(dtype=attn_delta.dtype) * attn_delta
         if surrogate_attention_output is not None:
             if partial_block is not None:
                 raise ValueError("Local surrogate requires a completed source history")
@@ -219,12 +227,16 @@ class MoiraiQwen3DecoderLayer(nn.Module):
             self.mlp_key_norm,
         )
         native_after_attention = native_hidden + attn_output if native_hidden is not None else None
-        if native_after_attention is not None:
-            z_mlp = native_after_attention + self.mlp_alpha * (z_mlp - native_after_attention)
+        if native_after_attention is not None and self._use_alpha:
+            mlp_delta = z_mlp - native_after_attention
+            z_mlp = (
+                native_after_attention
+                + self.mlp_alpha.to(dtype=mlp_delta.dtype) * mlp_delta
+            )
         mlp_output = self.mlp(self.post_attention_layernorm(z_mlp))
         next_partial = partial_after_attention + mlp_output
         layer_hidden = z_mlp + mlp_output
-        if native_after_attention is not None:
+        if native_after_attention is not None and self._use_alpha:
             layer_hidden = native_after_attention + mlp_output
         return (
             next_partial,
@@ -256,18 +268,30 @@ class MoiraiQwen3Model(Qwen3PreTrainedModel):
         )
         self.final_pseudo_query = nn.Parameter(torch.zeros(config.hidden_size))
         self.final_key_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.final_alpha = nn.Parameter(torch.zeros(1))
+        if config.formal_use_alpha:
+            self.final_alpha = nn.Parameter(
+                torch.full((1,), float(config.formal_alpha_init))
+            )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
         self.post_init()
         self._reset_pseudo_queries()
+        self._reset_formal_alphas()
 
     def _reset_pseudo_queries(self) -> None:
         for name, parameter in self.named_parameters():
             if "pseudo_query" in name:
                 nn.init.zeros_(parameter)
+
+    def _reset_formal_alphas(self) -> None:
+        if not self.config.formal_use_alpha:
+            return
+        with torch.no_grad():
+            for name, parameter in self.named_parameters():
+                if "alpha" in name:
+                    parameter.fill_(float(self.config.formal_alpha_init))
 
     def _partition(self) -> MoiraiPartition | None:
         if self.config.attnres_execution == "full":
@@ -504,7 +528,11 @@ class MoiraiQwen3Model(Qwen3PreTrainedModel):
                 self.final_pseudo_query,
                 self.final_key_norm,
             )
-            z_final = native_hidden + self.final_alpha * (routed_final - native_hidden)
+            if self.config.formal_use_alpha:
+                final_delta = routed_final - native_hidden
+                z_final = native_hidden + self.final_alpha.to(dtype=final_delta.dtype) * final_delta
+            else:
+                z_final = routed_final
             hidden_states = self.norm(z_final)
             output = BaseModelOutputWithPast(
                 last_hidden_state=hidden_states,

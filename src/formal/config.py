@@ -27,8 +27,8 @@ def load_formal_config(path: str | Path) -> dict[str, Any]:
 
 def enabled_tasks(config: dict[str, Any]) -> tuple[str, ...]:
     tasks = tuple(str(task) for task in config.get("tasks", {}).get("enabled", ()))
-    if len(tasks) < 2 or len(set(tasks)) != len(tasks):
-        raise ValueError("Formal tasks.enabled must contain at least two unique tasks")
+    if not tasks or len(set(tasks)) != len(tasks):
+        raise ValueError("Formal tasks.enabled must contain at least one unique task")
     unsupported = sorted(set(tasks) - set(SUPPORTED_TASKS))
     if unsupported:
         raise ValueError(f"Unsupported formal tasks: {unsupported}")
@@ -165,8 +165,19 @@ def validate_formal_config(config: dict[str, Any]) -> None:
         raise ValueError("Completed Block AttnRes history must use cumulative residuals")
     if attnres.get("partial_block_representation") != "cumulative_residual":
         raise ValueError("Partial Block AttnRes state must use cumulative residuals")
-    if attnres.get("alpha", {}).get("init") != 0.0:
-        raise ValueError("Formal Alpha must be zero-initialized")
+    alpha_config = attnres.get("alpha", {})
+    alpha_enabled = alpha_config.get("enabled", True)
+    if not isinstance(alpha_enabled, bool):
+        raise ValueError("Formal Alpha enabled flag must be boolean")
+    alpha_init = alpha_config.get("init")
+    if (
+        not isinstance(alpha_init, (int, float))
+        or not math.isfinite(float(alpha_init))
+        or float(alpha_init) < 0.0
+    ):
+        raise ValueError("Formal Alpha init must be a finite non-negative number")
+    if alpha_enabled and float(alpha_init) != 0.0 and alpha_config.get("allow_nonzero_init") is not True:
+        raise ValueError("Non-zero Alpha init requires an explicit experiment opt-in")
     for key in (
         "forbid_mean_pooling",
         "forbid_learnable_block_summary",
@@ -180,12 +191,13 @@ def validate_formal_config(config: dict[str, Any]) -> None:
     for key in ("site_specific", "task_specific", "input_independent_parameter"):
         if query.get(key) is not True:
             raise ValueError(f"Formal pseudo-query contract requires {key}=true")
-    alpha = attnres.get("alpha", {})
-    for key in ("site_specific", "task_specific"):
-        if alpha.get(key) is not True:
-            raise ValueError(f"Formal Alpha contract requires {key}=true")
-    if alpha.get("purpose") != "identity_preserving_gate":
-        raise ValueError("Formal Alpha must be an identity-preserving gate")
+    if alpha_enabled:
+        alpha = attnres.get("alpha", {})
+        for key in ("site_specific", "task_specific"):
+            if alpha.get(key) is not True:
+                raise ValueError(f"Formal Alpha contract requires {key}=true")
+        if alpha.get("purpose") != "identity_preserving_gate":
+            raise ValueError("Formal Alpha must be an identity-preserving gate")
     for key in (
         "recency_bias",
         "delta_source_formulation",
@@ -247,9 +259,11 @@ def validate_formal_config(config: dict[str, Any]) -> None:
     training = config.get("training", {})
     if training.get("type") != "full_parameter_joint_posttraining":
         raise ValueError("TRAINING_MODE_MISMATCH: formal training must be full-parameter joint post-training")
-    for key in ("shared_backbone", "train_backbone", "train_query", "train_alpha"):
+    for key in ("shared_backbone", "train_backbone", "train_query"):
         if training.get(key) is not True:
             raise ValueError(f"Formal training flag {key} must be true")
+    if training.get("train_alpha") is not alpha_enabled:
+        raise ValueError("Formal train_alpha flag must match attnres.alpha.enabled")
     if training.get("train_partition") is not False:
         raise ValueError("Formal partitions must be frozen during training")
     if training.get("task_sampling", {}).get("strategy") != "sequential_by_task_order":
@@ -315,13 +329,19 @@ def validate_formal_config(config: dict[str, Any]) -> None:
         group = groups.get(name, {})
         if float(group.get("lr", 0.0)) <= 0.0 or float(group.get("weight_decay", -1.0)) < 0.0:
             raise ValueError(f"Formal optimizer group {name} is invalid")
-    split_groups = [groups.get(name) for name in ("query", "alpha")]
-    if any(group is not None for group in split_groups):
-        if any(not isinstance(group, dict) for group in split_groups):
-            raise ValueError("Formal query and alpha optimizer groups must be declared together")
-        for name, group in zip(("query", "alpha"), split_groups):
-            if float(group.get("lr", 0.0)) <= 0.0 or float(group.get("weight_decay", -1.0)) < 0.0:
-                raise ValueError(f"Formal optimizer group {name} is invalid")
+    query_group = groups.get("query")
+    alpha_group = groups.get("alpha")
+    if not isinstance(query_group, dict):
+        raise ValueError("Formal query optimizer group is required")
+    if float(query_group.get("lr", 0.0)) <= 0.0 or float(query_group.get("weight_decay", -1.0)) < 0.0:
+        raise ValueError("Formal optimizer group query is invalid")
+    if alpha_enabled:
+        if not isinstance(alpha_group, dict):
+            raise ValueError("Formal Alpha optimizer group is required")
+        if float(alpha_group.get("lr", 0.0)) <= 0.0 or float(alpha_group.get("weight_decay", -1.0)) < 0.0:
+            raise ValueError("Formal optimizer group alpha is invalid")
+    elif alpha_group is not None:
+        raise ValueError("No-Alpha formal runs must not declare an Alpha optimizer group")
     scheduler = training.get("scheduler", {})
     if scheduler.get("type") != "cosine" or float(scheduler.get("warmup_ratio", -1.0)) != 0.03:
         raise ValueError("Formal scheduler must be cosine with warmup_ratio=0.03")
@@ -334,6 +354,8 @@ def validate_formal_config(config: dict[str, Any]) -> None:
     precision = training.get("precision", {})
     if precision.get("parameters") != "bfloat16":
         raise ValueError("Formal parameter precision must be BF16")
+    if precision.get("routing_parameters", "float32") != "float32":
+        raise ValueError("Formal Query/Alpha parameter precision must be FP32")
     if precision.get("loss_accumulation") != "float32":
         raise ValueError("Formal loss accumulation must be FP32")
 
@@ -341,8 +363,11 @@ def validate_formal_config(config: dict[str, Any]) -> None:
     if identity.get("required") is not True or identity.get("before_training") is not True:
         raise ValueError("Formal training requires a pre-training identity test")
     compare = identity.get("compare", ())
-    if len(compare) != 2 or compare[1] != "converted_attnres_alpha_zero":
-        raise ValueError("Formal identity test must compare Qwen3 and zero-alpha conversion")
+    expected_identity_mode = (
+        "converted_attnres_alpha_zero" if alpha_enabled else "converted_attnres_no_alpha"
+    )
+    if len(compare) != 2 or compare[1] != expected_identity_mode:
+        raise ValueError("Formal identity test conversion mode does not match Alpha configuration")
     if identity.get("fail_status") != "IDENTITY_CONVERSION_FAILED":
         raise ValueError("Formal identity test fail status is not configured")
     if identity.get("metrics") != ["max_abs_logit_diff", "mean_abs_logit_diff"]:
@@ -351,12 +376,13 @@ def validate_formal_config(config: dict[str, Any]) -> None:
     for key in (
         "require_backbone_update",
         "require_query_update",
-        "require_alpha_open",
         "require_partition_unchanged",
         "require_inactive_task_bank_unchanged",
     ):
         if verification.get(key) is not True:
             raise ValueError(f"Formal verification requires {key}=true")
+    if verification.get("require_alpha_open") is not alpha_enabled:
+        raise ValueError("Formal require_alpha_open flag must match Alpha configuration")
 
     probe = config.get("probe", {})
     if probe.get("labels") != list(tasks):
@@ -384,7 +410,8 @@ def validate_formal_config(config: dict[str, Any]) -> None:
 
     inference = config.get("inference", {})
     expected_routes = {
-        task: [f"P_{task}", f"Q_{task}", f"Alpha_{task}"]
+        task: [f"P_{task}", f"Q_{task}"]
+        + ([f"Alpha_{task}"] if alpha_enabled else [])
         for task in tasks
     }
     if inference.get("routes") != {
